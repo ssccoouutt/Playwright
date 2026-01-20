@@ -20,7 +20,7 @@ RUN pip install playwright==1.40.0 fastapi==0.104.1 uvicorn==0.24.0 python-multi
 # Install Chromium browser
 RUN playwright install chromium
 
-# Create HTML template
+# Create HTML template with persistent state
 RUN mkdir -p templates && cat > templates/index.html << 'EOF'
 <!DOCTYPE html>
 <html>
@@ -393,7 +393,7 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
                     </div>
                     <div class="status-card">
                         <div class="status-title">Automation Status</div>
-                        <div id="automationStatus" class="status-value">Stopped</div>
+                        <div id="automationStatus" class="status-value">Checking...</div>
                     </div>
                     <div class="status-card">
                         <div class="status-title">Cookies</div>
@@ -404,7 +404,7 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
                     </div>
                     <div class="status-card">
                         <div class="status-title">Last Action</div>
-                        <div id="lastAction" class="status-value">-</div>
+                        <div id="lastAction" class="status-value" style="color: #999;">-</div>
                     </div>
                 </div>
             </div>
@@ -429,7 +429,7 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
                     <div class="log-box" id="logBox">
                         <div class="log-entry">
                             <span class="log-time">[System]</span>
-                            <span class="log-info"> Dashboard initialized</span>
+                            <span class="log-info"> Loading dashboard...</span>
                         </div>
                     </div>
                     <button id="clearLogsBtn" class="btn btn-secondary" style="margin-top: 15px;">
@@ -450,7 +450,7 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
     <div id="notification" class="notification"></div>
     
     <script>
-        // State
+        // State management with localStorage
         let automationRunning = false;
         let currentUrl = 'https://www.google.com';
         let logs = [];
@@ -476,12 +476,124 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
         const loadingText = document.getElementById('loadingText');
         const notification = document.getElementById('notification');
         
-        // Initialize
-        updateStatus();
-        fetchCookiesStatus();
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', async () => {
+            // Clear old logs from logBox but keep initial message
+            logBox.innerHTML = '<div class="log-entry"><span class="log-time">[System]</span><span class="log-info"> Dashboard loading...</span></div>';
+            
+            // Load saved state from localStorage
+            loadSavedState();
+            
+            // Sync with backend to get actual state
+            await syncWithBackend();
+            
+            // Update UI
+            updateUI();
+            
+            // Start auto-refresh intervals
+            setInterval(fetchCookiesStatus, 30000);
+            setInterval(syncWithBackend, 5000); // Sync every 5 seconds
+            
+            addLog('Dashboard loaded successfully', 'success');
+            showNotification('Dashboard connected', 'success', 2000);
+        });
+        
+        // Load saved state from localStorage
+        function loadSavedState() {
+            try {
+                const savedUrl = localStorage.getItem('currentUrl');
+                const savedRunning = localStorage.getItem('automationRunning');
+                const savedLogs = localStorage.getItem('logs');
+                
+                if (savedUrl) {
+                    currentUrl = savedUrl;
+                    if (currentUrl !== 'https://www.google.com') {
+                        colabUrlInput.value = currentUrl;
+                    }
+                }
+                
+                if (savedRunning) {
+                    automationRunning = savedRunning === 'true';
+                }
+                
+                if (savedLogs) {
+                    const parsedLogs = JSON.parse(savedLogs);
+                    // Add logs but skip the initial loading message
+                    parsedLogs.forEach(log => {
+                        if (!log.message.includes('Loading dashboard')) {
+                            addLog(log.message, log.type, false);
+                        }
+                    });
+                }
+            } catch (e) {
+                console.error('Error loading saved state:', e);
+            }
+        }
+        
+        // Save state to localStorage
+        function saveState() {
+            try {
+                localStorage.setItem('currentUrl', currentUrl);
+                localStorage.setItem('automationRunning', automationRunning.toString());
+                localStorage.setItem('logs', JSON.stringify(logs.slice(-100))); // Keep last 100 logs
+            } catch (e) {
+                console.error('Error saving state:', e);
+            }
+        }
+        
+        // Sync with backend to get actual state
+        async function syncWithBackend() {
+            try {
+                const response = await fetch('/status');
+                const data = await response.json();
+                
+                if (data.browser_ready) {
+                    // Update from backend
+                    currentUrl = data.current_url;
+                    automationRunning = data.automation_running;
+                    
+                    // Update URL input if it's different from Google
+                    if (currentUrl !== 'https://www.google.com' && colabUrlInput.value !== currentUrl) {
+                        colabUrlInput.value = currentUrl;
+                    }
+                    
+                    // Save state
+                    saveState();
+                    
+                    // Update UI
+                    updateUI();
+                    
+                    return true;
+                }
+            } catch (error) {
+                console.error('Failed to sync with backend:', error);
+            }
+            return false;
+        }
+        
+        // Update UI elements
+        function updateUI() {
+            currentUrlSpan.textContent = currentUrl;
+            
+            if (automationRunning) {
+                automationStatusSpan.textContent = 'Running';
+                automationStatusSpan.style.color = '#2ed573';
+                startAutomationBtn.disabled = true;
+                stopAutomationBtn.disabled = false;
+            } else {
+                automationStatusSpan.textContent = 'Stopped';
+                automationStatusSpan.style.color = '#ff4757';
+                startAutomationBtn.disabled = false;
+                stopAutomationBtn.disabled = true;
+            }
+            
+            // Update timestamp
+            lastActionSpan.textContent = new Date().toLocaleTimeString();
+            lastActionSpan.style.color = '#666';
+        }
         
         // Helper Functions
-        function addLog(message, type = 'info') {
+        function addLog(message, type = 'info', save = true) {
             const timestamp = new Date().toLocaleTimeString();
             const logEntry = document.createElement('div');
             logEntry.className = 'log-entry';
@@ -492,13 +604,19 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
             logBox.appendChild(logEntry);
             logBox.scrollTop = logBox.scrollHeight;
             
-            // Keep only last 50 logs
+            // Add to logs array
+            logs.push({ time: timestamp, message, type });
+            
+            // Save to localStorage
+            if (save) {
+                saveState();
+            }
+            
+            // Keep only last 50 logs visible
             const entries = logBox.querySelectorAll('.log-entry');
             if (entries.length > 50) {
                 entries[0].remove();
             }
-            
-            logs.push({ time: timestamp, message, type });
         }
         
         function showNotification(message, type = 'info', duration = 3000) {
@@ -518,16 +636,6 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
         
         function hideLoading() {
             loadingOverlay.style.display = 'none';
-        }
-        
-        function updateStatus() {
-            currentUrlSpan.textContent = currentUrl;
-            automationStatusSpan.textContent = automationRunning ? 'Running' : 'Stopped';
-            automationStatusSpan.style.color = automationRunning ? '#2ed573' : '#ff4757';
-            
-            // Update button states
-            startAutomationBtn.disabled = automationRunning;
-            stopAutomationBtn.disabled = !automationRunning;
         }
         
         async function fetchCookiesStatus() {
@@ -569,7 +677,8 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
                 
                 if (data.success) {
                     currentUrl = url;
-                    updateStatus();
+                    saveState();
+                    updateUI();
                     addLog(`Loaded URL: ${url}`, 'success');
                     showNotification('URL loaded successfully', 'success');
                     await takeScreenshot(); // Auto-screenshot after loading
@@ -620,7 +729,8 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
                 
                 if (data.success) {
                     automationRunning = true;
-                    updateStatus();
+                    saveState();
+                    updateUI();
                     addLog('Automation started - Pressing Ctrl+Enter every 5 minutes', 'success');
                     showNotification('Automation started!', 'success');
                 } else {
@@ -645,7 +755,8 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
                 
                 if (data.success) {
                     automationRunning = false;
-                    updateStatus();
+                    saveState();
+                    updateUI();
                     addLog('Automation stopped', 'success');
                     showNotification('Automation stopped', 'info');
                 } else {
@@ -691,7 +802,8 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
                 if (data.success) {
                     currentUrl = 'https://www.google.com';
                     colabUrlInput.value = '';
-                    updateStatus();
+                    saveState();
+                    updateUI();
                     addLog('Restored to Google.com', 'success');
                     showNotification('Restored to Google.com', 'success');
                     await takeScreenshot();
@@ -708,20 +820,16 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
         
         // Event Listeners
         loadUrlBtn.addEventListener('click', loadUrl);
-        
         getScreenshotBtn.addEventListener('click', takeScreenshot);
-        
         startAutomationBtn.addEventListener('click', startAutomation);
-        
         stopAutomationBtn.addEventListener('click', stopAutomation);
-        
         refreshCookiesBtn.addEventListener('click', refreshCookies);
-        
         restoreBtn.addEventListener('click', restoreGoogle);
         
         clearLogsBtn.addEventListener('click', () => {
             logBox.innerHTML = '<div class="log-entry"><span class="log-time">[System]</span><span class="log-info"> Logs cleared</span></div>';
             logs = [];
+            saveState();
             addLog('Logs cleared', 'info');
         });
         
@@ -731,18 +839,26 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
             }
         });
         
-        // Auto-refresh cookies status every 30 seconds
-        setInterval(fetchCookiesStatus, 30000);
+        // Handle page visibility changes (when user switches tabs or minimizes)
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) {
+                // Page is visible again, sync with backend
+                syncWithBackend();
+            }
+        });
         
-        // Initial log
-        addLog('Dashboard ready - Load a Colab URL to start', 'info');
+        // Handle page before unload (save state)
+        window.addEventListener('beforeunload', () => {
+            saveState();
+        });
     </script>
 </body>
 </html>
 EOF
 
-# Create FastAPI server
+# Create FastAPI server with lifespan handlers
 RUN cat > main.py << 'EOF'
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -753,7 +869,6 @@ import os
 import asyncio
 import time
 from datetime import datetime
-import threading
 import logging
 
 # Configure logging
@@ -762,18 +877,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-app = FastAPI(title="Colab Automation Dashboard")
-
-# Setup templates
-templates = Jinja2Templates(directory="templates")
-
-# Create directories
-os.makedirs("screenshots", exist_ok=True)
-os.makedirs("static", exist_ok=True)
-
-# Mount static files
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Global state
 browser = None
@@ -847,13 +950,14 @@ async def init_browser():
         playwright_instance = await async_playwright().start()
         browser = await playwright_instance.chromium.launch(
             headless=True,
-            args=['--no-sandbox', '--disable-dev-shm-usage']
+            args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled']
         )
         
         # Create context with user agent
         context = await browser.new_context(
             viewport={'width': 1920, 'height': 1080},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            ignore_https_errors=True
         )
         
         # Add cookies if available
@@ -889,16 +993,22 @@ async def take_screenshot(label: str = ""):
         filename = f"screenshot_{label}_{uuid.uuid4().hex[:8]}_{int(time.time())}.png"
         filepath = os.path.join("screenshots", filename)
         
+        # Add a small delay to ensure page is stable
+        await asyncio.sleep(1)
+        
         await page.screenshot(path=filepath, full_page=True)
         logger.info(f"📸 Screenshot saved: {filename}")
         
         # Clean old screenshots (keep last 20)
-        screenshots = sorted(os.listdir("screenshots"), key=lambda x: os.path.getctime(os.path.join("screenshots", x)))
-        for old_file in screenshots[:-20]:
-            try:
-                os.remove(os.path.join("screenshots", old_file))
-            except:
-                pass
+        try:
+            screenshots = sorted(os.listdir("screenshots"), key=lambda x: os.path.getctime(os.path.join("screenshots", x)))
+            for old_file in screenshots[:-20]:
+                try:
+                    os.remove(os.path.join("screenshots", old_file))
+                except:
+                    pass
+        except:
+            pass
         
         return filename
         
@@ -938,20 +1048,8 @@ async def automation_loop():
     
     logger.info("🛑 Automation loop stopped")
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize browser on startup."""
-    logger.info("=" * 60)
-    logger.info("🤖 Colab Automation Dashboard Starting")
-    logger.info("=" * 60)
-    
-    success = await init_browser()
-    if not success:
-        logger.error("❌ Failed to initialize browser - some features may not work")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown."""
+async def cleanup_browser():
+    """Cleanup browser resources."""
     global browser, playwright_instance, automation_task
     
     # Stop automation
@@ -959,17 +1057,60 @@ async def shutdown_event():
     automation_running = False
     
     if automation_task:
-        automation_task.cancel()
+        try:
+            automation_task.cancel()
+        except:
+            pass
     
     # Close browser
     if browser:
-        await browser.close()
-        logger.info("✅ Browser closed")
+        try:
+            await browser.close()
+            logger.info("✅ Browser closed")
+        except:
+            pass
     
     if playwright_instance:
-        await playwright_instance.stop()
+        try:
+            await playwright_instance.stop()
+            logger.info("✅ Playwright stopped")
+        except:
+            pass
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for FastAPI."""
+    # Startup
+    logger.info("=" * 60)
+    logger.info("🤖 Colab Automation Dashboard Starting")
+    logger.info("=" * 60)
     
+    # Initialize browser
+    success = await init_browser()
+    if not success:
+        logger.error("❌ Failed to initialize browser - some features may not work")
+    else:
+        logger.info("✅ Browser ready and waiting for connections")
+    
+    yield  # App runs here
+    
+    # Shutdown
+    logger.info("🛑 Shutting down...")
+    await cleanup_browser()
     logger.info("👋 Server shutdown complete")
+
+# Create FastAPI app with lifespan
+app = FastAPI(title="Colab Automation Dashboard", lifespan=lifespan)
+
+# Setup templates
+templates = Jinja2Templates(directory="templates")
+
+# Create directories
+os.makedirs("screenshots", exist_ok=True)
+os.makedirs("static", exist_ok=True)
+
+# Mount static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
@@ -1008,8 +1149,12 @@ async def load_url(request: Request):
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
         
-        # Navigate to URL
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        # Navigate to URL with longer timeout for Colab
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        except Exception as nav_error:
+            logger.warning(f"Navigation had issues but continuing: {nav_error}")
+            # Try to continue anyway
         
         current_url = url
         logger.info(f"✅ Loaded: {url}")
@@ -1091,7 +1236,10 @@ async def stop_automation():
         automation_running = False
         
         if automation_task:
-            automation_task.cancel()
+            try:
+                automation_task.cancel()
+            except:
+                pass
             automation_task = None
         
         logger.info("⏹️ Automation stopped")
@@ -1159,15 +1307,6 @@ async def restore_google():
         logger.error(f"❌ Restore error: {e}")
         return JSONResponse({"success": False, "error": str(e)})
 
-@app.get("/logs")
-async def get_logs():
-    """Get recent logs (simplified)."""
-    return JSONResponse({
-        "logs": [
-            {"time": datetime.now().isoformat(), "message": "System is running", "type": "info"}
-        ]
-    })
-
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
@@ -1175,6 +1314,7 @@ async def health_check():
         "status": "healthy",
         "browser_ready": page is not None,
         "automation_running": automation_running,
+        "current_url": current_url,
         "timestamp": datetime.now().isoformat()
     })
 
@@ -1183,7 +1323,17 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
 EOF
 
-# Remove cron related lines (lines 1194-1198)
+# Create a simple cleanup script
+RUN cat > cleanup.sh << 'EOF'
+#!/bin/bash
+# Cleanup old screenshots
+find /app/screenshots -name "*.png" -mmin +60 -delete 2>/dev/null || true
+EOF
+
+RUN chmod +x cleanup.sh
+
+# Create directories
+RUN mkdir -p /app/screenshots /app/static
 
 # Expose port
 EXPOSE 8000
