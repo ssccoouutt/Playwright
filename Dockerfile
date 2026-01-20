@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y \
     libx11-6 libxcb1 libxcomposite1 \
     libxdamage1 libxext6 libxfixes3 \
     libxrandr2 libgbm1 libasound2 \
-    libcups2 libxkbcommon0 \  # ← THESE WERE MISSING
+    libcups2 libxkbcommon0 \
     fonts-liberation fonts-unifont \
     libpangocairo-1.0-0 libpango-1.0-0 \
     && rm -rf /var/lib/apt/lists/*
@@ -24,10 +24,11 @@ RUN playwright install chromium
 RUN cat > automation.py << 'EOF'
 from playwright.sync_api import sync_playwright
 import os
+import sys
 from datetime import datetime
 
 print("=" * 60)
-print("🚀 PLAYWRIGHT AUTOMATION - WITH ALL DEPENDENCIES")
+print("🚀 PLAYWRIGHT AUTOMATION - FIXED VERSION")
 print("=" * 60)
 
 try:
@@ -65,9 +66,8 @@ try:
                 
 except Exception as e:
     print(f"\n❌ ERROR: {e}")
-    print("\nDebug info:")
-    print(f"Python: {sys.version}")
-    print(f"Playwright version: {p.__version__ if 'p' in locals() else 'N/A'}")
+    import traceback
+    traceback.print_exc()
 
 print("\n" + "=" * 60)
 print("🎉 AUTOMATION COMPLETED!")
