@@ -741,22 +741,20 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
 </html>
 EOF
 
-# Create FastAPI server with Colab automation
+# Create FastAPI server
 RUN cat > main.py << 'EOF'
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from playwright.async_api import async_playwright
 import uuid
 import os
 import asyncio
-import json
 import time
 from datetime import datetime
-from typing import Optional
-import logging
 import threading
+import logging
 
 # Configure logging
 logging.basicConfig(
@@ -786,9 +784,8 @@ automation_running = False
 automation_task = None
 current_url = "https://www.google.com"
 cookies = []
-sse_clients = []
 
-# Cookies download URL (you can change this to your own)
+# Cookies download URL
 COOKIES_DOWNLOAD_URL = "https://drive.usercontent.google.com/download?id=1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm&export=download"
 
 def parse_netscape_cookies(content: str):
@@ -898,7 +895,10 @@ async def take_screenshot(label: str = ""):
         # Clean old screenshots (keep last 20)
         screenshots = sorted(os.listdir("screenshots"), key=lambda x: os.path.getctime(os.path.join("screenshots", x)))
         for old_file in screenshots[:-20]:
-            os.remove(os.path.join("screenshots", old_file))
+            try:
+                os.remove(os.path.join("screenshots", old_file))
+            except:
+                pass
         
         return filename
         
@@ -1183,19 +1183,7 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
 EOF
 
-# Create a simple cleanup script
-RUN cat > cleanup.sh << 'EOF'
-#!/bin/bash
-# Cleanup old screenshots
-find /app/screenshots -name "*.png" -mmin +30 -delete
-EOF
-
-RUN chmod +x cleanup.sh
-
-# Create a cron job for cleanup
-RUN echo "*/5 * * * * /app/cleanup.sh" > /etc/cron.d/cleanup
-RUN chmod 0644 /etc/cron.d/cleanup
-RUN crontab /etc/cron.d/cleanup
+# Remove cron related lines (lines 1194-1198)
 
 # Expose port
 EXPOSE 8000
