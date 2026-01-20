@@ -95,6 +95,11 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
             color: #666;
             display: none;
         }
+        .error {
+            color: #dc3545;
+            margin-top: 10px;
+            display: none;
+        }
     </style>
 </head>
 <body>
@@ -114,7 +119,11 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
         </form>
         
         <div class="loading" id="loading">
-            <p>⏳ Taking screenshot, please wait...</p>
+            <p>⏳ Taking screenshot, please wait 3-5 seconds...</p>
+        </div>
+        
+        <div class="error" id="error">
+            <p id="errorText"></p>
         </div>
         
         <div class="result" id="result">
@@ -134,10 +143,12 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
             const url = document.getElementById('urlInput').value.trim();
             const loading = document.getElementById('loading');
             const result = document.getElementById('result');
+            const error = document.getElementById('error');
             
-            // Show loading, hide result
+            // Reset UI
             loading.style.display = 'block';
             result.style.display = 'none';
+            error.style.display = 'none';
             
             try {
                 // Call the API
@@ -157,10 +168,12 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
                     document.getElementById('downloadLink').href = `/download/${data.filename}`;
                     result.style.display = 'block';
                 } else {
-                    alert('Error: ' + data.error);
+                    document.getElementById('errorText').textContent = 'Error: ' + data.error;
+                    error.style.display = 'block';
                 }
             } catch (error) {
-                alert('Failed to take screenshot: ' + error.message);
+                document.getElementById('errorText').textContent = 'Failed to take screenshot: ' + error.message;
+                error.style.display = 'block';
             } finally {
                 loading.style.display = 'none';
             }
@@ -173,19 +186,19 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
 </html>
 EOF
 
-# Create the FastAPI web server
+# Create the FastAPI web server with ASYNC Playwright
 RUN cat > main.py << 'EOF'
-from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 import uuid
 import os
-from datetime import datetime
-import shutil
-import threading
+import asyncio
 import time
+from datetime import datetime
+import threading
 
 app = FastAPI(title="Screenshot Tool")
 
@@ -198,6 +211,29 @@ os.makedirs("static", exist_ok=True)
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Store browser instance for reuse
+_browser = None
+_playwright = None
+
+async def get_browser():
+    """Get or create browser instance (singleton)"""
+    global _browser, _playwright
+    if _browser is None:
+        _playwright = await async_playwright().start()
+        _browser = await _playwright.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-dev-shm-usage']
+        )
+    return _browser
+
+async def cleanup_browser():
+    """Cleanup browser on shutdown"""
+    global _browser, _playwright
+    if _browser:
+        await _browser.close()
+    if _playwright:
+        await _playwright.stop()
 
 # Cleanup old screenshots every hour
 def cleanup_old_files():
@@ -225,7 +261,7 @@ async def home(request: Request):
 
 @app.post("/screenshot")
 async def take_screenshot(request: Request):
-    """API endpoint to take screenshot"""
+    """API endpoint to take screenshot - ASYNC VERSION"""
     try:
         data = await request.json()
         url = data.get("url", "https://google.com")
@@ -236,42 +272,42 @@ async def take_screenshot(request: Request):
         
         print(f"Taking screenshot of: {url}")
         
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-dev-shm-usage']
-            )
-            
-            page = browser.new_page(viewport={'width': 1920, 'height': 1080})
-            
-            try:
-                page.goto(url, wait_until="networkidle", timeout=30000)
-            except:
-                # If timeout, still take screenshot of what loaded
-                pass
-            
-            # Generate unique filename
-            filename = f"screenshot_{uuid.uuid4().hex[:8]}_{int(time.time())}.png"
-            filepath = os.path.join("screenshots", filename)
-            
-            # Take screenshot
-            page.screenshot(path=filepath, full_page=True)
-            
-            browser.close()
-            
-            # Get file size
-            file_size = os.path.getsize(filepath)
-            
-            return JSONResponse({
-                "success": True,
-                "filename": filename,
-                "url": url,
-                "size": file_size,
-                "timestamp": datetime.now().isoformat(),
-                "view_url": f"/screenshots/{filename}",
-                "download_url": f"/download/{filename}"
-            })
-            
+        # Get browser instance
+        browser = await get_browser()
+        
+        # Create new page context
+        context = await browser.new_context(viewport={'width': 1920, 'height': 1080})
+        page = await context.new_page()
+        
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+        except Exception as e:
+            print(f"Navigation warning: {e}")
+            # Continue anyway
+        
+        # Generate unique filename
+        filename = f"screenshot_{uuid.uuid4().hex[:8]}_{int(time.time())}.png"
+        filepath = os.path.join("screenshots", filename)
+        
+        # Take screenshot
+        await page.screenshot(path=filepath, full_page=True)
+        
+        # Cleanup
+        await context.close()
+        
+        # Get file size
+        file_size = os.path.getsize(filepath)
+        
+        return JSONResponse({
+            "success": True,
+            "filename": filename,
+            "url": url,
+            "size": file_size,
+            "timestamp": datetime.now().isoformat(),
+            "view_url": f"/screenshots/{filename}",
+            "download_url": f"/download/{filename}"
+        })
+        
     except Exception as e:
         return JSONResponse({
             "success": False,
@@ -306,32 +342,53 @@ async def health_check():
 @app.get("/api/screenshot")
 async def quick_screenshot(url: str = "https://google.com"):
     """Quick API endpoint (GET request)"""
-    # Same logic as POST endpoint
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
-        page = browser.new_page()
-        page.goto(url)
-        
-        filename = f"quick_{uuid.uuid4().hex[:8]}.png"
-        filepath = os.path.join("screenshots", filename)
-        page.screenshot(path=filepath)
-        browser.close()
-        
-        return {
-            "success": True,
-            "filename": filename,
-            "download": f"/download/{filename}"
-        }
+    browser = await get_browser()
+    context = await browser.new_context()
+    page = await context.new_page()
+    
+    try:
+        await page.goto(url, wait_until="networkidle", timeout=15000)
+    except:
+        pass
+    
+    filename = f"quick_{uuid.uuid4().hex[:8]}.png"
+    filepath = os.path.join("screenshots", filename)
+    await page.screenshot(path=filepath, full_page=True)
+    
+    await context.close()
+    
+    return {
+        "success": True,
+        "filename": filename,
+        "download": f"/download/{filename}"
+    }
 
-if __name__ == "__main__":
-    import uvicorn
+@app.on_event("startup")
+async def startup_event():
+    """Initialize browser on startup"""
     print("🚀 Starting Screenshot Web Server...")
     print("📸 Visit http://localhost:8000")
     print("⚡ API: POST /screenshot with JSON: {\"url\": \"https://example.com\"}")
     print("⚡ Quick API: GET /api/screenshot?url=https://example.com")
+    
+    # Warm up the browser
+    try:
+        await get_browser()
+        print("✅ Browser initialized successfully")
+    except Exception as e:
+        print(f"⚠️ Browser initialization warning: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup browser on shutdown"""
+    await cleanup_browser()
+    print("👋 Browser closed")
+
+if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
 EOF
 
