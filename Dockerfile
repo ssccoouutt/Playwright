@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Minimal dependencies for Playwright
+# Install minimal dependencies
 RUN apt-get update && apt-get install -y \
     libnss3 \
     libx11-6 \
@@ -15,15 +15,16 @@ RUN apt-get update && apt-get install -y \
     libcups2 \
     libxkbcommon0 \
     fonts-liberation \
+    fonts-unifont \  # This replaces ttf-unifont
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Install only essential packages
-RUN pip install playwright==1.40.0 fastapi==0.104.1 uvicorn==0.24.0
+RUN pip install playwright==1.40.0 fastapi==0.104.1 uvicorn==0.24.0 requests
 
-# Install Chromium (minimal)
-RUN playwright install chromium --with-deps chromium
+# Install Chromium WITHOUT --with-deps (we installed dependencies manually)
+RUN playwright install chromium
 
 # Create simple HTML
 RUN mkdir -p templates && cat > templates/index.html << 'EOF'
@@ -82,7 +83,7 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
         
         // Initialize
         updateStatus();
-        setInterval(updateStatus, 5000); // Update every 5 seconds
+        setInterval(updateStatus, 5000);
         
         function addLog(message) {
             const logBox = document.getElementById('logBox');
@@ -105,7 +106,7 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
                 document.getElementById('startBtn').disabled = automationRunning;
                 document.getElementById('stopBtn').disabled = !automationRunning;
             } catch (error) {
-                console.error('Status update failed:', error);
+                console.error('Status update failed');
             }
         }
         
@@ -166,7 +167,7 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
                 const data = await response.json();
                 
                 if (data.success) {
-                    addLog('✅ Automation started - pressing Ctrl+Enter every 5 minutes');
+                    addLog('✅ Automation started');
                     updateStatus();
                 }
             } catch (error) {
@@ -231,7 +232,7 @@ RUN mkdir -p templates && cat > templates/index.html << 'EOF'
 </html>
 EOF
 
-# Create Python server with auto-restart and minimal logging
+# Create Python server
 RUN cat > main.py << 'EOF'
 import asyncio
 import os
@@ -246,7 +247,7 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from playwright.async_api import async_playwright
 
-# Configure minimal logging
+# Minimal logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(message)s',
@@ -254,7 +255,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global state with auto-restart capability
 class BrowserManager:
     def __init__(self):
         self.playwright = None
@@ -268,65 +268,71 @@ class BrowserManager:
         self.last_restart = None
         
     async def start(self):
-        """Start or restart browser"""
+        """Start browser"""
         try:
             await self.cleanup()
-            logger.info("🚀 Starting browser...")
+            logger.info("Starting browser...")
             
             self.playwright = await async_playwright().start()
             
-            # Minimal browser launch for 512MB RAM
+            # Minimal browser for 512MB
             self.browser = await self.playwright.chromium.launch(
                 headless=True,
                 args=[
                     '--no-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-gpu',
-                    '--disable-software-rasterizer',
-                    '--disable-background-timer-throttling',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
-                    '--memory-pressure-off',
-                    '--disable-features=VizDisplayCompositor'
+                    '--single-process',  # Single process to save RAM
+                    '--no-zygote',
+                    '--no-first-run',
+                    '--disable-setuid-sandbox',
+                    '--disable-background-networking',
+                    '--disable-default-apps',
+                    '--disable-extensions',
+                    '--disable-sync',
+                    '--disable-translate',
+                    '--metrics-recording-only',
+                    '--safebrowsing-disable-auto-update',
+                    '--disable-client-side-phishing-detection',
+                    '--disable-component-update',
+                    '--disable-features=site-per-process,TranslateUI',
+                    '--window-size=1280,720'
                 ]
             )
             
-            # Single context for minimal memory
             context = await self.browser.new_context(
-                viewport={'width': 1280, 'height': 720},  # Smaller viewport
+                viewport={'width': 1280, 'height': 720},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             )
             
-            # Load cookies if available
+            # Load cookies
             await self.load_cookies(context)
             
             self.page = await context.new_page()
             
-            # Navigate to Google
-            logger.info("🌐 Loading Google.com...")
+            logger.info("Loading Google.com...")
             await self.page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=30000)
             
             self.restart_count += 1
             self.last_restart = datetime.now()
-            logger.info(f"✅ Browser ready (Restart #{self.restart_count})")
+            logger.info(f"Browser ready (Restart #{self.restart_count})")
             return True
             
         except Exception as e:
-            logger.error(f"❌ Browser start failed: {e}")
+            logger.error(f"Browser start failed: {e}")
             await self.cleanup()
             return False
     
     async def load_cookies(self, context):
-        """Load cookies from URL"""
+        """Load cookies"""
         try:
             import requests
             COOKIES_URL = "https://drive.usercontent.google.com/download?id=1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm&export=download"
             
-            logger.info("📥 Downloading cookies...")
+            logger.info("Loading cookies...")
             response = requests.get(COOKIES_URL, timeout=10)
             
             if response.status_code == 200:
-                # Parse Netscape format cookies
                 self.cookies = []
                 for line in response.text.strip().split('\n'):
                     line = line.strip()
@@ -344,17 +350,13 @@ class BrowserManager:
                 
                 if self.cookies:
                     await context.add_cookies(self.cookies)
-                    logger.info(f"✅ Loaded {len(self.cookies)} cookies")
-                else:
-                    logger.info("⚠️  No cookies loaded")
-            else:
-                logger.info("⚠️  Could not download cookies")
-                
+                    logger.info(f"Loaded {len(self.cookies)} cookies")
+                    
         except Exception as e:
-            logger.info(f"⚠️  Cookie load failed: {e}")
+            logger.info(f"Cookie load failed: {e}")
     
     async def cleanup(self):
-        """Cleanup resources"""
+        """Cleanup"""
         if self.automation_task:
             self.automation_running = False
             try:
@@ -381,66 +383,62 @@ class BrowserManager:
                 pass
     
     async def restart_if_needed(self):
-        """Check if browser needs restart and restart it"""
+        """Restart browser if dead"""
         try:
-            # Try to check if page is alive
             if self.page:
-                await self.page.title()  # Simple check
+                await self.page.title()
                 return True
         except:
-            logger.warning("⚠️  Browser appears dead, restarting...")
+            logger.warning("Browser dead, restarting...")
             return await self.start()
         return True
     
     async def automation_loop(self):
-        """Background automation task"""
-        logger.info("🤖 Automation started")
+        """Automation task"""
+        logger.info("Automation started")
         iteration = 0
         
         while self.automation_running:
             try:
-                # Check browser health before each iteration
                 if not await self.restart_if_needed():
-                    logger.error("❌ Browser restart failed, stopping automation")
+                    logger.error("Browser restart failed")
                     self.automation_running = False
                     break
                 
                 iteration += 1
-                logger.info(f"⏱️  Pressing Ctrl+Enter (#{iteration})...")
+                logger.info(f"Pressing Ctrl+Enter (#{iteration})...")
                 
-                # Press Ctrl+Enter
                 await self.page.keyboard.down('Control')
                 await self.page.press('body', 'Enter')
                 await self.page.keyboard.up('Control')
                 
-                logger.info(f"✅ Ctrl+Enter pressed (#{iteration})")
+                logger.info(f"Ctrl+Enter pressed (#{iteration})")
                 
-                # Wait 5 minutes, checking every second if still running
+                # Wait 5 minutes
                 for _ in range(300):
                     if not self.automation_running:
                         break
                     await asyncio.sleep(1)
                     
             except Exception as e:
-                logger.error(f"❌ Automation error: {e}")
-                await asyncio.sleep(10)  # Wait before retry
+                logger.error(f"Automation error: {e}")
+                await asyncio.sleep(10)
         
-        logger.info("🛑 Automation stopped")
+        logger.info("Automation stopped")
 
-# Create browser manager
+# Create manager
 browser_manager = BrowserManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown"""
-    # Startup
+    """Lifespan"""
     logger.info("=" * 40)
-    logger.info("🤖 Colab Automation Starting")
+    logger.info("Colab Automation Starting")
     logger.info("=" * 40)
     
-    # Try to start browser
+    # Start browser
     success = False
-    for attempt in range(3):  # Try 3 times
+    for attempt in range(3):
         logger.info(f"Attempt {attempt + 1}/3 to start browser...")
         success = await browser_manager.start()
         if success:
@@ -448,221 +446,185 @@ async def lifespan(app: FastAPI):
         await asyncio.sleep(5)
     
     if not success:
-        logger.error("❌ Failed to start browser after 3 attempts")
+        logger.error("Failed to start browser")
     
-    yield  # App runs here
+    yield
     
-    # Shutdown
-    logger.info("🛑 Shutting down...")
+    logger.info("Shutting down...")
     await browser_manager.cleanup()
-    logger.info("👋 Goodbye")
 
 # Create app
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 templates = Jinja2Templates(directory="templates")
 
-# Create screenshots directory
+# Create directory
 os.makedirs("screenshots", exist_ok=True)
 
 @app.get("/")
 async def home(request: Request):
-    """Serve main page"""
     return templates.TemplateResponse("index.html", {"request": request})
 
 @app.get("/status")
 async def get_status():
-    """Get current status"""
     return JSONResponse({
         "current_url": browser_manager.current_url,
         "automation_running": browser_manager.automation_running,
         "cookies_count": len(browser_manager.cookies),
-        "restart_count": browser_manager.restart_count,
-        "last_restart": browser_manager.last_restart.isoformat() if browser_manager.last_restart else None
+        "restart_count": browser_manager.restart_count
     })
 
 @app.post("/load")
 async def load_url(request: Request):
-    """Load a URL"""
     try:
         data = await request.json()
         url = data.get("url", "").strip()
         
         if not url:
-            return JSONResponse({"success": False, "error": "No URL provided"})
+            return JSONResponse({"success": False, "error": "No URL"})
         
-        # Ensure browser is alive
         if not await browser_manager.restart_if_needed():
-            return JSONResponse({"success": False, "error": "Browser not available"})
+            return JSONResponse({"success": False, "error": "Browser not ready"})
         
-        # Ensure URL has protocol
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
         
-        logger.info(f"🌐 Loading: {url}")
+        logger.info(f"Loading: {url}")
         
         try:
             await browser_manager.page.goto(url, wait_until="domcontentloaded", timeout=60000)
             browser_manager.current_url = url
-            logger.info(f"✅ Loaded: {url}")
+            logger.info(f"Loaded: {url}")
             return JSONResponse({"success": True, "url": url})
-        except Exception as nav_error:
-            logger.warning(f"⚠️  Navigation issue: {nav_error}")
-            # Still return success if we got somewhere
+        except Exception as e:
+            logger.warning(f"Navigation issue: {e}")
             browser_manager.current_url = url
-            return JSONResponse({"success": True, "url": url, "warning": str(nav_error)})
+            return JSONResponse({"success": True, "url": url, "warning": str(e)})
             
     except Exception as e:
-        logger.error(f"❌ Load error: {e}")
+        logger.error(f"Load error: {e}")
         return JSONResponse({"success": False, "error": str(e)})
 
 @app.get("/screenshot")
 async def get_screenshot():
-    """Take screenshot"""
     try:
         if not await browser_manager.restart_if_needed():
-            return JSONResponse({"success": False, "error": "Browser not available"})
+            return JSONResponse({"success": False, "error": "Browser not ready"})
         
         filename = f"screenshot_{uuid.uuid4().hex[:8]}.png"
         filepath = os.path.join("screenshots", filename)
         
-        await browser_manager.page.screenshot(path=filepath, full_page=False)  # Not full page to save memory
+        await browser_manager.page.screenshot(path=filepath, full_page=False)
         
         # Clean old screenshots
         try:
             files = os.listdir("screenshots")
-            if len(files) > 10:
-                for old_file in sorted(files)[:-10]:
+            if len(files) > 5:  # Keep only 5 screenshots
+                for old_file in sorted(files)[:-5]:
                     os.remove(os.path.join("screenshots", old_file))
         except:
             pass
         
-        logger.info(f"📸 Saved: {filename}")
+        logger.info(f"Screenshot: {filename}")
         return JSONResponse({"success": True, "filename": filename})
         
     except Exception as e:
-        logger.error(f"❌ Screenshot error: {e}")
+        logger.error(f"Screenshot error: {e}")
         return JSONResponse({"success": False, "error": str(e)})
 
 @app.get("/screenshots/{filename}")
 async def serve_screenshot(filename: str):
-    """Serve screenshot"""
     filepath = os.path.join("screenshots", filename)
     if os.path.exists(filepath):
         return FileResponse(filepath, media_type="image/png")
-    raise HTTPException(status_code=404, detail="Screenshot not found")
+    raise HTTPException(status_code=404)
 
 @app.post("/automation/start")
 async def start_automation():
-    """Start automation"""
     try:
         if browser_manager.automation_running:
             return JSONResponse({"success": False, "error": "Already running"})
         
         if not await browser_manager.restart_if_needed():
-            return JSONResponse({"success": False, "error": "Browser not available"})
+            return JSONResponse({"success": False, "error": "Browser not ready"})
         
         browser_manager.automation_running = True
         browser_manager.automation_task = asyncio.create_task(browser_manager.automation_loop())
         
-        logger.info("▶️  Automation started")
-        return JSONResponse({"success": True, "message": "Automation started"})
+        logger.info("Automation started")
+        return JSONResponse({"success": True, "message": "Started"})
         
     except Exception as e:
-        logger.error(f"❌ Start error: {e}")
+        logger.error(f"Start error: {e}")
         return JSONResponse({"success": False, "error": str(e)})
 
 @app.post("/automation/stop")
 async def stop_automation():
-    """Stop automation"""
     browser_manager.automation_running = False
-    logger.info("⏹️  Automation stopped")
-    return JSONResponse({"success": True, "message": "Automation stopped"})
+    logger.info("Automation stopped")
+    return JSONResponse({"success": True, "message": "Stopped"})
 
 @app.post("/cookies/refresh")
 async def refresh_cookies():
-    """Refresh cookies"""
     try:
         if not await browser_manager.restart_if_needed():
-            return JSONResponse({"success": False, "error": "Browser not available"})
+            return JSONResponse({"success": False, "error": "Browser not ready"})
         
-        # Get current context and reload cookies
         context = browser_manager.page.context
         await context.clear_cookies()
         await browser_manager.load_cookies(context)
         
-        # Reload current page
         await browser_manager.page.reload()
         
-        logger.info("🔄 Cookies refreshed")
+        logger.info("Cookies refreshed")
         return JSONResponse({
             "success": True,
-            "cookies_count": len(browser_manager.cookies),
-            "message": "Cookies refreshed"
+            "cookies_count": len(browser_manager.cookies)
         })
         
     except Exception as e:
-        logger.error(f"❌ Cookie refresh error: {e}")
+        logger.error(f"Cookie error: {e}")
         return JSONResponse({"success": False, "error": str(e)})
 
 @app.post("/restore")
 async def restore_google():
-    """Go back to Google"""
     try:
         if not await browser_manager.restart_if_needed():
-            return JSONResponse({"success": False, "error": "Browser not available"})
+            return JSONResponse({"success": False, "error": "Browser not ready"})
         
         await browser_manager.page.goto("https://www.google.com", wait_until="domcontentloaded")
         browser_manager.current_url = "https://www.google.com"
         
-        logger.info("🏠 Restored to Google.com")
-        return JSONResponse({"success": True, "message": "Restored to Google.com"})
+        logger.info("Restored to Google")
+        return JSONResponse({"success": True, "message": "Restored"})
         
     except Exception as e:
-        logger.error(f"❌ Restore error: {e}")
+        logger.error(f"Restore error: {e}")
         return JSONResponse({"success": False, "error": str(e)})
 
 @app.get("/health")
 async def health_check():
-    """Health endpoint for Koyeb"""
     try:
-        # Simple health check
         if browser_manager.page:
-            return JSONResponse({"status": "healthy", "browser": "alive"})
+            return JSONResponse({"status": "healthy"})
         else:
-            return JSONResponse({"status": "starting", "browser": "initializing"})
+            return JSONResponse({"status": "starting"})
     except:
-        return JSONResponse({"status": "unhealthy", "browser": "dead"}, status_code=500)
+        return JSONResponse({"status": "unhealthy"}, status_code=500)
 
 if __name__ == "__main__":
     import uvicorn
-    # Run with minimal workers for 512MB RAM
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8000)),
-        workers=1,  # Single worker to save RAM
-        log_level="warning"  # Reduce log noise
+        workers=1,
+        log_level="warning"
     )
 EOF
 
 # Create directories
 RUN mkdir -p /app/screenshots
 
-# Create startup script to handle crashes
-RUN cat > start.sh << 'EOF'
-#!/bin/bash
-echo "========================================"
-echo "🤖 Starting Colab Automation"
-echo "========================================"
-echo "Memory: $(free -m | awk 'NR==2{printf "%.1f/%.1f MB", $3/1024, $2/1024}')"
-echo "========================================"
-
-# Start the server
-python main.py
-EOF
-
-RUN chmod +x start.sh
-
 EXPOSE 8000
 
-CMD ["./start.sh"]
+CMD ["python", "main.py"]
