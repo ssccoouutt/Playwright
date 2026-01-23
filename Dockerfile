@@ -224,12 +224,16 @@ class SessionManager:
         return cookies
 
     async def launch(self):
-        """Restores browser engine only if crashed or requested."""
+        """Restores browser engine with saved state to prevent logout."""
         if self.is_busy: return
         self.is_busy = True
         
         try:
-            logger.info(">>> ENGINE: INITIALIZING BROWSER")
+            logger.info(">>> ENGINE: INITIATING RE-LAUNCH")
+            # Sync state one last time before closing if possible
+            if self.context:
+                await self.sync_state()
+
             if self.context: await self.context.close()
             if self.browser: await self.browser.close()
             if self.pw: await self.pw.stop()
@@ -245,13 +249,13 @@ class SessionManager:
             )
             
             if self.storage_state:
-                logger.info(f">>> ENGINE: RESTORING SESSION ({len(json.dumps(self.storage_state)) // 1024} KB)")
+                logger.info(f">>> ENGINE: RESTORING SAVED SESSION...")
                 self.context = await self.browser.new_context(
                     storage_state=self.storage_state,
                     viewport={'width': 1280, 'height': 720}
                 )
             else:
-                logger.info(">>> ENGINE: LOADING SEED COOKIES")
+                logger.info(">>> ENGINE: NO SAVED STATE - LOADING SEED COOKIES")
                 self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
                 try:
                     r = requests.get(self.cookie_url, timeout=10)
@@ -263,8 +267,10 @@ class SessionManager:
 
             for task in self.tasks:
                 task["page"] = await self.context.new_page()
-                try: await task["page"].goto(task["url"], wait_until="domcontentloaded", timeout=60000)
-                except: pass
+                try: 
+                    await task["page"].goto(task["url"], wait_until="domcontentloaded", timeout=60000)
+                except: 
+                    pass
             
             logger.info(">>> ENGINE: ONLINE")
         except Exception as e:
@@ -273,12 +279,12 @@ class SessionManager:
             self.is_busy = False
 
     async def sync_state(self):
-        """Saves session state to RAM. Displays size in logs."""
+        """Saves current session state to memory."""
         if self.context:
             try:
                 self.storage_state = await self.context.storage_state()
                 size_kb = len(json.dumps(self.storage_state)) // 1024
-                logger.info(f"SESSION SAVED: {size_kb} KB")
+                logger.info(f"STATE SYNCED: {size_kb} KB")
                 return size_kb
             except Exception as e:
                 logger.error(f"Sync failed: {e}")
@@ -287,26 +293,13 @@ class SessionManager:
 mgr = SessionManager()
 
 async def watchdog():
-    """Restores ONLY on crash. Simply logs RAM usage every 10 mins."""
+    """Relaunches browser every 15 minutes as requested."""
     while True:
-        await asyncio.sleep(600) 
+        await asyncio.sleep(900) # Exactly 15 minutes
         if mgr.is_busy: continue
         
-        # Check Browser Status
-        is_healthy = mgr.browser and mgr.browser.is_connected()
-        
-        # Memory Check (Logging Only)
-        proc = psutil.Process(os.getpid())
-        mem = proc.memory_info().rss / (1024*1024)
-        for c in proc.children(recursive=True):
-            try: mem += c.memory_info().rss / (1024*1024)
-            except: pass
-            
-        if not is_healthy:
-            logger.info(f"!!! ENGINE DISCONNECTED - AUTO-RESTORING")
-            await mgr.launch()
-        else:
-            logger.info(f"STATUS: Engine Healthy ({int(mem)}MB RAM)")
+        logger.info(">>> WATCHDOG: 15-MIN SCHEDULED RELAUNCH")
+        await mgr.launch()
 
 async def automation():
     """Sequential automation every 5 minutes."""
@@ -361,7 +354,9 @@ async def add_task(request: Request):
     try: await pg.goto(url, wait_until="domcontentloaded", timeout=60000)
     except: pass
     mgr.tasks.append({"url": url, "page": pg, "running": True})
-    await mgr.sync_state() # SAVE ON ADD
+    
+    # Save session immediately when adding a tab
+    await mgr.sync_state()
     return {"success": True}
 
 @app.post("/tasks/{idx}/toggle")
@@ -376,7 +371,9 @@ async def remove(idx: int):
         t = mgr.tasks.pop(idx)
         try: await t["page"].close()
         except: pass
-        await mgr.sync_state() # SAVE ON REMOVE (Size will decrease)
+        
+        # Save session immediately when removing a tab (size will decrease)
+        await mgr.sync_state()
     return {"success": True}
 
 @app.get("/tasks/{idx}/screenshot")
