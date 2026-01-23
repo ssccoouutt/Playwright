@@ -42,31 +42,24 @@ RUN cat > templates/index.html << 'EOF'
         .status-badge { font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: bold; background: #1e293b; }
         .alive { color: #4ade80; border: 1px solid #064e3b; }
         .dead { color: #f87171; border: 1px solid #7f1d1d; }
-
         .input-group { display: flex; gap: 8px; margin-bottom: 15px; }
         input { flex: 1; padding: 10px; border-radius: 6px; border: 1px solid #334155; background: #020617; color: white; outline: none; }
         input:focus { border-color: var(--primary); }
-
         .btn { padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer; font-weight: 600; transition: 0.2s; color: white; display: flex; align-items: center; gap: 6px; }
         .btn-p { background: var(--primary); }
         .btn-d { background: #ef4444; }
         .btn-s { background: #334155; }
-        
         .task-list { display: flex; flex-direction: column; gap: 8px; }
         .task-item { background: #1e293b; padding: 12px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; }
         .task-url { font-size: 12px; color: #94a3b8; max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
         .log-box { background: #000; color: #10b981; padding: 10px; border-radius: 6px; height: 250px; overflow-y: auto; font-family: monospace; font-size: 11px; line-height: 1.4; border: 1px solid #1e293b; }
-        
         .grid { display: grid; grid-template-columns: 1fr 320px; gap: 15px; }
         @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
-
         .stats { display: flex; justify-content: space-around; margin-top: 10px; }
         .stat-item { text-align: center; }
         .stat-val { font-size: 18px; font-weight: bold; display: block; }
         .stat-lbl { font-size: 10px; color: #64748b; text-transform: uppercase; }
-
-        .preview-img { width: 100%; border-radius: 6px; border: 1px solid #334155; margin-top: 10px; cursor: pointer; }
+        .preview-img { width: 100%; border-radius: 6px; border: 1px solid #334155; margin-top: 10px; }
     </style>
 </head>
 <body>
@@ -85,31 +78,26 @@ RUN cat > templates/index.html << 'EOF'
                         <button class="btn btn-p" onclick="addTask()">Add</button>
                     </div>
                 </div>
-
                 <div class="card">
                     <h3><i class="fas fa-microchip"></i> Active Tabs</h3>
                     <div id="taskList" class="task-list" style="margin-top:12px"></div>
                 </div>
-
                 <div id="ssCard" class="card" style="display:none">
                     <h3><i class="fas fa-camera"></i> Tab Preview</h3>
                     <img id="preview" class="preview-img">
                 </div>
             </main>
-
             <aside>
                 <div class="card">
                     <h3><i class="fas fa-chart-line"></i> Performance</h3>
                     <div class="stats">
                         <div class="stat-item"><span id="mem" class="stat-val">0</span><span class="stat-lbl">RAM (MB)</span></div>
-                        <div class="stat-item"><span id="uptime" class="stat-val">0</span><span class="stat-lbl">UPTIME (M)</span></div>
+                        <div class="stat-item"><span id="sessSize" class="stat-val">0</span><span class="stat-lbl">SESS (KB)</span></div>
                     </div>
                     <div style="margin-top:15px; display:grid; gap:8px">
-                        <button class="btn btn-s" onclick="saveState()"><i class="fas fa-save"></i> Manual Sync</button>
-                        <button class="btn btn-d" onclick="relaunch()"><i class="fas fa-power-off"></i> Hard Restart</button>
+                        <button class="btn btn-s" onclick="relaunch()"><i class="fas fa-power-off"></i> Force Relaunch</button>
                     </div>
                 </div>
-
                 <div class="card">
                     <h3><i class="fas fa-terminal"></i> Activity</h3>
                     <div id="logs" class="log-box"></div>
@@ -132,13 +120,11 @@ RUN cat > templates/index.html << 'EOF'
             try {
                 const r = await fetch('/status');
                 const d = await r.json();
-                
                 const bs = document.getElementById('bStatus');
                 bs.className = `status-badge ${d.alive ? 'alive' : 'dead'}`;
                 bs.textContent = d.alive ? 'BROWSER ONLINE' : 'ENGINE RESTARTING';
-                
                 document.getElementById('mem').textContent = d.memory;
-                document.getElementById('uptime').textContent = d.uptime;
+                document.getElementById('sessSize').textContent = d.session_size_kb;
 
                 const list = document.getElementById('taskList');
                 list.innerHTML = '';
@@ -153,7 +139,7 @@ RUN cat > templates/index.html << 'EOF'
                         <div style="display:flex; gap:5px">
                             <button class="btn btn-s" onclick="view(${i})"><i class="fas fa-eye"></i></button>
                             <button class="btn ${t.running?'btn-d':'btn-p'}" onclick="toggle(${i})"><i class="fas fa-${t.running?'stop':'play'}"></i></button>
-                            <button class="btn btn-s" onclick="remove(${i})"><i class="fas fa-trash text-red-400"></i></button>
+                            <button class="btn btn-s" onclick="remove(${i})"><i class="fas fa-trash"></i></button>
                         </div>
                     `;
                     list.appendChild(item);
@@ -166,14 +152,12 @@ RUN cat > templates/index.html << 'EOF'
             if(!url) return;
             await fetch('/tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url})});
             document.getElementById('colabUrl').value = '';
-            log("New tab added to session");
             refresh();
         }
 
         async function toggle(i) { await fetch(`/tasks/${i}/toggle`, {method:'POST'}); refresh(); }
         async function remove(i) { await fetch(`/tasks/${i}`, {method:'DELETE'}); refresh(); }
-        async function saveState() { await fetch('/sync', {method:'POST'}); log("Session storage state synced!"); }
-        async function relaunch() { log("Hard relaunching engine...", true); await fetch('/relaunch', {method:'POST'}); }
+        async function relaunch() { await fetch('/relaunch', {method:'POST'}); }
 
         async function view(i) {
             const r = await fetch(`/tasks/${i}/screenshot`);
@@ -200,15 +184,16 @@ import logging
 import requests
 import json
 import time
+import sys
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from playwright.async_api import async_playwright
 
-# Strict Logging - only show important system changes
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-logger = logging.getLogger("ColabBot")
+# Optimized Logging
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("Bot")
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
@@ -223,7 +208,6 @@ class SessionManager:
         self.tasks = [] 
         self.lock = asyncio.Lock()
         self.is_busy = False
-        self.start_time = time.time()
         self.storage_state = None 
         self.cookie_url = "https://drive.usercontent.google.com/download?id=1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm&export=download"
 
@@ -240,12 +224,12 @@ class SessionManager:
         return cookies
 
     async def launch(self):
-        """Launches browser engine with optimized settings."""
+        """Restores browser engine only if crashed or requested."""
         if self.is_busy: return
         self.is_busy = True
         
         try:
-            logger.info(">>> ENGINE: INITIALIZING BROWSER ENGINE")
+            logger.info(">>> ENGINE: INITIALIZING BROWSER")
             if self.context: await self.context.close()
             if self.browser: await self.browser.close()
             if self.pw: await self.pw.stop()
@@ -254,25 +238,20 @@ class SessionManager:
             self.browser = await self.pw.chromium.launch(
                 headless=True,
                 args=[
-                    '--no-sandbox', 
-                    '--disable-dev-shm-usage', 
-                    '--disable-gpu',
+                    '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
                     '--js-flags="--max-old-space-size=128"',
-                    '--disable-extensions', 
-                    '--no-zygote', 
-                    '--single-process'
+                    '--disable-extensions', '--no-zygote', '--single-process'
                 ]
             )
             
-            # Use current RAM-based state if we have it, else download seed cookies
             if self.storage_state:
-                logger.info(">>> ENGINE: RESTORING FROM RAM SESSION STATE")
+                logger.info(f">>> ENGINE: RESTORING SESSION ({len(json.dumps(self.storage_state)) // 1024} KB)")
                 self.context = await self.browser.new_context(
                     storage_state=self.storage_state,
                     viewport={'width': 1280, 'height': 720}
                 )
             else:
-                logger.info(">>> ENGINE: LOADING SEED COOKIES FROM DRIVE")
+                logger.info(">>> ENGINE: LOADING SEED COOKIES")
                 self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
                 try:
                     r = requests.get(self.cookie_url, timeout=10)
@@ -280,71 +259,67 @@ class SessionManager:
                         cookies = self.parse_netscape(r.text)
                         await self.context.add_cookies(cookies)
                 except Exception as e:
-                    logger.error(f"!!! ENGINE: COOKIE FETCH FAILED: {e}")
+                    logger.error(f"!!! COOKIE FETCH FAILED: {e}")
 
-            # Re-initialize pages for existing tasks
             for task in self.tasks:
                 task["page"] = await self.context.new_page()
-                try: 
-                    await task["page"].goto(task["url"], wait_until="domcontentloaded", timeout=60000)
+                try: await task["page"].goto(task["url"], wait_until="domcontentloaded", timeout=60000)
                 except: pass
             
-            logger.info(">>> ENGINE: BROWSER ONLINE")
+            logger.info(">>> ENGINE: ONLINE")
         except Exception as e:
-            logger.error(f"!!! ENGINE: CRITICAL FAILURE: {e}")
+            logger.error(f"!!! CRITICAL FAILURE: {e}")
         finally:
             self.is_busy = False
 
     async def sync_state(self):
-        """Saves session without accumulating unnecessary disk data."""
+        """Saves session state to RAM. Displays size in logs."""
         if self.context:
             try:
-                # Capture current cookies and storage into memory
                 self.storage_state = await self.context.storage_state()
+                size_kb = len(json.dumps(self.storage_state)) // 1024
+                logger.info(f"SESSION SAVED: {size_kb} KB")
+                return size_kb
             except Exception as e:
-                logger.error(f"State sync failed: {e}")
+                logger.error(f"Sync failed: {e}")
+        return 0
 
 mgr = SessionManager()
 
 async def watchdog():
-    """Manages memory and health on a 15-minute cycle."""
+    """Restores ONLY on crash. Simply logs RAM usage every 10 mins."""
     while True:
-        # Check every 15 minutes as requested
-        await asyncio.sleep(900) 
+        await asyncio.sleep(600) 
         if mgr.is_busy: continue
         
-        # 1. Capture session state to RAM
-        await mgr.sync_state()
-        
-        # 2. Check Browser Status
+        # Check Browser Status
         is_healthy = mgr.browser and mgr.browser.is_connected()
         
-        # 3. Memory Check
+        # Memory Check (Logging Only)
         proc = psutil.Process(os.getpid())
         mem = proc.memory_info().rss / (1024*1024)
         for c in proc.children(recursive=True):
             try: mem += c.memory_info().rss / (1024*1024)
             except: pass
             
-        if not is_healthy or mem > 400:
-            reason = "CRASH" if not is_healthy else "HIGH RAM"
-            logger.info(f"!!! WATCHDOG: RESTARTING ({reason}: {int(mem)}MB)")
+        if not is_healthy:
+            logger.info(f"!!! ENGINE DISCONNECTED - AUTO-RESTORING")
             await mgr.launch()
         else:
-            logger.info(f"WATCHDOG: ENGINE HEALTHY ({int(mem)}MB RAM)")
+            logger.info(f"STATUS: Engine Healthy ({int(mem)}MB RAM)")
 
 async def automation():
-    """Sequential automation to avoid input clashes."""
+    """Sequential automation every 5 minutes."""
     while True:
-        await asyncio.sleep(300) # Every 5 minutes
+        await asyncio.sleep(300)
         if mgr.is_busy or not mgr.context: continue
         
         for idx, task in enumerate(mgr.tasks):
             if task["running"] and task["page"]:
                 async with mgr.lock:
                     try:
+                        logger.info(f"KEEP-ALIVE: Tab #{idx+1}")
                         p = task["page"]
-                        logger.info(f"KEEP-ALIVE: Tab #{idx+1} ({task['url'][:30]}...)")
                         await p.bring_to_front()
                         await p.keyboard.down('Control')
                         await p.keyboard.press('Enter')
@@ -369,11 +344,11 @@ async def get_status():
     for c in proc.children(recursive=True):
         try: mem += c.memory_info().rss / (1024*1024)
         except: pass
-    uptime = int((time.time() - mgr.start_time) / 60)
+    size_kb = len(json.dumps(mgr.storage_state)) // 1024 if mgr.storage_state else 0
     return {
         "alive": mgr.browser.is_connected() if mgr.browser else False,
         "memory": int(mem),
-        "uptime": uptime,
+        "session_size_kb": size_kb,
         "tasks": [{"url": t["url"], "running": t["running"]} for t in mgr.tasks]
     }
 
@@ -386,6 +361,7 @@ async def add_task(request: Request):
     try: await pg.goto(url, wait_until="domcontentloaded", timeout=60000)
     except: pass
     mgr.tasks.append({"url": url, "page": pg, "running": True})
+    await mgr.sync_state() # SAVE ON ADD
     return {"success": True}
 
 @app.post("/tasks/{idx}/toggle")
@@ -400,6 +376,7 @@ async def remove(idx: int):
         t = mgr.tasks.pop(idx)
         try: await t["page"].close()
         except: pass
+        await mgr.sync_state() # SAVE ON REMOVE (Size will decrease)
     return {"success": True}
 
 @app.get("/tasks/{idx}/screenshot")
@@ -412,11 +389,6 @@ async def ss(idx: int):
             return {"success": True, "file": name}
         except: pass
     return {"success": False}
-
-@app.post("/sync")
-async def sync():
-    await mgr.sync_state()
-    return {"success": True}
 
 @app.post("/relaunch")
 async def relaunch():
