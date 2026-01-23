@@ -206,9 +206,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from playwright.async_api import async_playwright
 
-# Strict Logging for Koyeb
-logging.basicConfig(level=logging.INFO, format="%(message)s")
-logger = logging.getLogger("Bot")
+# Strict Logging - only show important system changes
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+logger = logging.getLogger("ColabBot")
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
@@ -224,7 +224,7 @@ class SessionManager:
         self.lock = asyncio.Lock()
         self.is_busy = False
         self.start_time = time.time()
-        self.storage_state = None # THE SECRET: Latest session data saved in RAM
+        self.storage_state = None 
         self.cookie_url = "https://drive.usercontent.google.com/download?id=1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm&export=download"
 
     def parse_netscape(self, text):
@@ -240,12 +240,12 @@ class SessionManager:
         return cookies
 
     async def launch(self):
-        """Launches browser. Uses saved state if available, else original cookies."""
+        """Launches browser engine with optimized settings."""
         if self.is_busy: return
         self.is_busy = True
         
         try:
-            logger.info(">>> ENGINE: INITIATING")
+            logger.info(">>> ENGINE: INITIALIZING BROWSER ENGINE")
             if self.context: await self.context.close()
             if self.browser: await self.browser.close()
             if self.pw: await self.pw.stop()
@@ -254,81 +254,89 @@ class SessionManager:
             self.browser = await self.pw.chromium.launch(
                 headless=True,
                 args=[
-                    '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
-                    '--js-flags="--max-old-space-size=128"', # Ultra strict RAM limit
-                    '--disable-extensions', '--no-zygote', '--single-process'
+                    '--no-sandbox', 
+                    '--disable-dev-shm-usage', 
+                    '--disable-gpu',
+                    '--js-flags="--max-old-space-size=128"',
+                    '--disable-extensions', 
+                    '--no-zygote', 
+                    '--single-process'
                 ]
             )
             
-            # SESSION RESTORATION LOGIC
+            # Use current RAM-based state if we have it, else download seed cookies
             if self.storage_state:
-                # Use the latest session state (Cookies + LocalStorage) captured before crash
-                logger.info(">>> ENGINE: RESTORING FROM LAST KNOWN STATE (SAVES LOGIN)")
+                logger.info(">>> ENGINE: RESTORING FROM RAM SESSION STATE")
                 self.context = await self.browser.new_context(
                     storage_state=self.storage_state,
                     viewport={'width': 1280, 'height': 720}
                 )
             else:
-                # First time use: Load original cookies
-                logger.info(">>> ENGINE: FIRST RUN - LOADING ORIGINAL COOKIES")
+                logger.info(">>> ENGINE: LOADING SEED COOKIES FROM DRIVE")
                 self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
                 try:
                     r = requests.get(self.cookie_url, timeout=10)
-                    cookies = self.parse_netscape(r.text)
-                    await self.context.add_cookies(cookies)
-                except: logger.error("!!! ENGINE: FAILED TO LOAD SEED COOKIES")
+                    if r.status_code == 200:
+                        cookies = self.parse_netscape(r.text)
+                        await self.context.add_cookies(cookies)
+                except Exception as e:
+                    logger.error(f"!!! ENGINE: COOKIE FETCH FAILED: {e}")
 
-            # Re-open all tabs
+            # Re-initialize pages for existing tasks
             for task in self.tasks:
                 task["page"] = await self.context.new_page()
-                try: await task["page"].goto(task["url"], wait_until="domcontentloaded", timeout=60000)
+                try: 
+                    await task["page"].goto(task["url"], wait_until="domcontentloaded", timeout=60000)
                 except: pass
             
-            logger.info(">>> ENGINE: ONLINE")
+            logger.info(">>> ENGINE: BROWSER ONLINE")
         except Exception as e:
             logger.error(f"!!! ENGINE: CRITICAL FAILURE: {e}")
         finally:
             self.is_busy = False
 
     async def sync_state(self):
-        """Captures current session state so we don't need 'one-time' cookies again."""
+        """Saves session without accumulating unnecessary disk data."""
         if self.context:
             try:
+                # Capture current cookies and storage into memory
                 self.storage_state = await self.context.storage_state()
-            except: pass
+            except Exception as e:
+                logger.error(f"State sync failed: {e}")
 
 mgr = SessionManager()
 
 async def watchdog():
-    """Monitors RAM and connectivity. Proactively saves state."""
+    """Manages memory and health on a 15-minute cycle."""
     while True:
-        await asyncio.sleep(60) # Sync every minute
+        # Check every 15 minutes as requested
+        await asyncio.sleep(900) 
         if mgr.is_busy: continue
         
-        # 1. Capture current session state (Prevents logout if crash happens)
+        # 1. Capture session state to RAM
         await mgr.sync_state()
         
-        # 2. Check Browser Health
-        if not mgr.browser or not mgr.browser.is_connected():
-            logger.info("!!! WATCHDOG: DETECTED CRASH - AUTO-RESTORE INITIATED")
-            await mgr.launch()
-            continue
-
-        # 3. RAM Guard (Proactive Cleanup)
+        # 2. Check Browser Status
+        is_healthy = mgr.browser and mgr.browser.is_connected()
+        
+        # 3. Memory Check
         proc = psutil.Process(os.getpid())
         mem = proc.memory_info().rss / (1024*1024)
         for c in proc.children(recursive=True):
             try: mem += c.memory_info().rss / (1024*1024)
             except: pass
             
-        if mem > 400: # 80% of 512MB
-            logger.info(f"!!! WATCHDOG: HIGH RAM ({int(mem)}MB) - SAVING SESSION AND CYCLING")
-            await mgr.launch() # Relaunch will use the state we just synced
+        if not is_healthy or mem > 400:
+            reason = "CRASH" if not is_healthy else "HIGH RAM"
+            logger.info(f"!!! WATCHDOG: RESTARTING ({reason}: {int(mem)}MB)")
+            await mgr.launch()
+        else:
+            logger.info(f"WATCHDOG: ENGINE HEALTHY ({int(mem)}MB RAM)")
 
 async def automation():
-    """One-by-one keypress for each tab."""
+    """Sequential automation to avoid input clashes."""
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(300) # Every 5 minutes
         if mgr.is_busy or not mgr.context: continue
         
         for idx, task in enumerate(mgr.tasks):
@@ -336,12 +344,12 @@ async def automation():
                 async with mgr.lock:
                     try:
                         p = task["page"]
-                        logger.info(f"KEEP-ALIVE: Tab #{idx+1}")
+                        logger.info(f"KEEP-ALIVE: Tab #{idx+1} ({task['url'][:30]}...)")
                         await p.bring_to_front()
                         await p.keyboard.down('Control')
                         await p.keyboard.press('Enter')
                         await p.keyboard.up('Control')
-                        await asyncio.sleep(5) 
+                        await asyncio.sleep(2) 
                     except: pass
 
 @app.on_event("startup")
