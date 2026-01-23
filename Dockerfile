@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Install system dependencies for Playwright/Chromium
+# Install system dependencies for Playwright
 RUN apt-get update && apt-get install -y \
     wget gnupg ca-certificates \
     libnss3 libatk1.0-0 libatk-bridge2.0-0 \
@@ -14,404 +14,341 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Install dependencies
+# Install Python packages
 RUN pip install playwright==1.40.0 fastapi==0.104.1 uvicorn==0.24.0 python-multipart jinja2 requests psutil
 
 # Install Chromium
 RUN playwright install chromium
 
 # Create directories
-RUN mkdir -p templates screenshots static
+RUN mkdir -p templates screenshots
 
-# --- HTML TEMPLATE (Enhanced for Multiple Automations) ---
+# --- DASHBOARD UI ---
 RUN cat > templates/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🤖 Multi-Colab Automation</title>
+    <title>🤖 Colab Guard Pro</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        :root { --primary: #6366f1; --bg: #f8fafc; --card: #ffffff; --text: #1e293b; }
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; }
+        :root { --primary: #8b5cf6; --bg: #020617; --card: #0f172a; --text: #f1f5f9; }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', system-ui, sans-serif; }
         body { background: var(--bg); color: var(--text); padding: 15px; }
-        .container { max-width: 1200px; margin: 0 auto; }
+        .container { max-width: 1000px; margin: 0 auto; }
+        .card { background: var(--card); border-radius: 12px; padding: 20px; border: 1px solid #1e293b; margin-bottom: 15px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.4); }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .status-badge { font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: bold; background: #1e293b; }
+        .alive { color: #4ade80; border: 1px solid #064e3b; }
+        .dead { color: #f87171; border: 1px solid #7f1d1d; }
+
+        .input-group { display: flex; gap: 8px; margin-bottom: 15px; }
+        input { flex: 1; padding: 10px; border-radius: 6px; border: 1px solid #334155; background: #020617; color: white; outline: none; }
+        input:focus { border-color: var(--primary); }
+
+        .btn { padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer; font-weight: 600; transition: 0.2s; color: white; display: flex; align-items: center; gap: 6px; }
+        .btn-p { background: var(--primary); }
+        .btn-d { background: #ef4444; }
+        .btn-s { background: #334155; }
         
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; background: white; padding: 15px 25px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .header h1 { font-size: 1.5rem; color: var(--primary); display: flex; align-items: center; gap: 10px; }
+        .task-list { display: flex; flex-direction: column; gap: 8px; }
+        .task-item { background: #1e293b; padding: 12px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; }
+        .task-url { font-size: 12px; color: #94a3b8; max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+        .log-box { background: #000; color: #10b981; padding: 10px; border-radius: 6px; height: 250px; overflow-y: auto; font-family: monospace; font-size: 11px; line-height: 1.4; border: 1px solid #1e293b; }
         
-        .grid { display: grid; grid-template-columns: 1fr 350px; gap: 20px; }
-        @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
-        
-        .card { background: var(--card); border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); margin-bottom: 20px; }
-        .card h2 { font-size: 1.1rem; margin-bottom: 15px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #f1f5f9; padding-bottom: 10px; }
+        .grid { display: grid; grid-template-columns: 1fr 320px; gap: 15px; }
+        @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
 
-        .input-bar { display: flex; gap: 10px; margin-bottom: 20px; }
-        input[type="url"] { flex: 1; padding: 12px; border: 1px solid #e2e8f0; border-radius: 8px; outline: none; }
-        input[type="url"]:focus { border-color: var(--primary); }
+        .stats { display: flex; justify-content: space-around; margin-top: 10px; }
+        .stat-item { text-align: center; }
+        .stat-val { font-size: 18px; font-weight: bold; display: block; }
+        .stat-lbl { font-size: 10px; color: #64748b; text-transform: uppercase; }
 
-        .task-list { display: flex; flex-direction: column; gap: 10px; }
-        .task-item { display: flex; align-items: center; justify-content: space-between; padding: 15px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; transition: all 0.2s; }
-        .task-item:hover { border-color: var(--primary); }
-        .task-info { flex: 1; min-width: 0; }
-        .task-url { font-size: 0.85rem; color: #64748b; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .task-status { font-size: 0.75rem; font-weight: bold; margin-top: 4px; display: flex; align-items: center; gap: 5px; }
-        .status-running { color: #10b981; }
-        .status-stopped { color: #ef4444; }
-
-        .btn { padding: 10px 18px; border-radius: 8px; border: none; cursor: pointer; font-weight: 600; font-size: 0.9rem; display: flex; align-items: center; gap: 8px; transition: 0.2s; }
-        .btn-p { background: var(--primary); color: white; }
-        .btn-s { background: #f1f5f9; color: #475569; }
-        .btn-d { background: #fee2e2; color: #dc2626; }
-        .btn:hover { opacity: 0.9; transform: translateY(-1px); }
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-
-        .log-box { background: #0f172a; color: #38bdf8; padding: 15px; border-radius: 10px; height: 250px; overflow-y: auto; font-family: 'Consolas', monospace; font-size: 12px; border: 1px solid #1e293b; }
-        .log-entry { margin-bottom: 4px; border-bottom: 1px solid #1e293b; padding-bottom: 2px; }
-        .log-time { color: #64748b; }
-
-        .stats { display: flex; flex-direction: column; gap: 12px; }
-        .stat-item { display: flex; justify-content: space-between; font-size: 0.9rem; }
-        .stat-val { font-weight: bold; font-family: monospace; }
-        
-        .mem-track { height: 8px; background: #e2e8f0; border-radius: 4px; overflow: hidden; }
-        .mem-bar { height: 100%; background: var(--primary); transition: width 0.5s; }
-
-        .screenshot-container { position: relative; width: 100%; border-radius: 8px; overflow: hidden; border: 2px solid #e2e8f0; background: #f1f5f9; min-height: 200px; display: flex; align-items: center; justify-content: center; }
-        .screenshot-container img { width: 100%; height: auto; display: block; }
-        .loader { position: fixed; top: 0; left: 0; width: 100%; height: 3px; background: var(--primary); animation: loading 2s infinite; display: none; z-index: 1000; }
-        @keyframes loading { 0% { left: -100%; width: 30%; } 100% { left: 100%; width: 30%; } }
+        .preview-img { width: 100%; border-radius: 6px; border: 1px solid #334155; margin-top: 10px; cursor: pointer; }
     </style>
 </head>
 <body>
-    <div id="topLoader" class="loader"></div>
     <div class="container">
         <header class="header">
-            <h1><i class="fas fa-robot"></i> Colab Multi-Manager</h1>
-            <div id="globalStatus" style="font-size: 0.8rem; color: #64748b;">
-                Browser: <span id="bState" style="font-weight: bold;">Initializing...</span>
-            </div>
+            <h1><i class="fas fa-shield-halved"></i> Colab Guard Pro</h1>
+            <div id="bStatus" class="status-badge dead">Connecting...</div>
         </header>
 
         <div class="grid">
             <main>
                 <div class="card">
-                    <h2><i class="fas fa-plus"></i> New Automation</h2>
-                    <div class="input-bar">
-                        <input type="url" id="colabUrl" placeholder="https://colab.research.google.com/drive/...">
-                        <button class="btn btn-p" onclick="addTask()"><i class="fas fa-plus"></i> Add Tab</button>
+                    <h3><i class="fas fa-plus"></i> New Automation Tab</h3>
+                    <div class="input-group" style="margin-top:12px">
+                        <input type="url" id="colabUrl" placeholder="Paste Colab Drive URL here...">
+                        <button class="btn btn-p" onclick="addTask()">Add</button>
                     </div>
                 </div>
 
                 <div class="card">
-                    <h2><i class="fas fa-layer-group"></i> Active Automations</h2>
-                    <div id="taskList" class="task-list">
-                        <!-- Tasks inject here -->
-                    </div>
+                    <h3><i class="fas fa-microchip"></i> Active Tabs</h3>
+                    <div id="taskList" class="task-list" style="margin-top:12px"></div>
                 </div>
 
-                <div class="card">
-                    <h2><i class="fas fa-camera"></i> Live Preview</h2>
-                    <div id="previewBox" class="screenshot-container">
-                        <p style="color: #94a3b8;">Select a tab to see live preview</p>
-                    </div>
+                <div id="ssCard" class="card" style="display:none">
+                    <h3><i class="fas fa-camera"></i> Tab Preview</h3>
+                    <img id="preview" class="preview-img">
                 </div>
             </main>
 
             <aside>
                 <div class="card">
-                    <h2><i class="fas fa-microchip"></i> Resource Monitor</h2>
+                    <h3><i class="fas fa-chart-line"></i> Performance</h3>
                     <div class="stats">
-                        <div class="stat-item"><span>RAM Usage:</span> <span id="memText" class="stat-val">0 / 512 MB</span></div>
-                        <div class="mem-track"><div id="memBar" class="mem-bar" style="width: 0%"></div></div>
-                        <div class="stat-item"><span>Active Tabs:</span> <span id="tabCount" class="stat-val">0</span></div>
-                        <div class="stat-item"><span>Uptime:</span> <span id="uptime" class="stat-val">00:00:00</span></div>
+                        <div class="stat-item"><span id="mem" class="stat-val">0</span><span class="stat-lbl">RAM (MB)</span></div>
+                        <div class="stat-item"><span id="uptime" class="stat-val">0</span><span class="stat-lbl">UPTIME (M)</span></div>
                     </div>
-                    <div style="margin-top: 15px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                        <button class="btn btn-s" onclick="refreshCookies()"><i class="fas fa-cookie"></i> Cookies</button>
-                        <button class="btn btn-d" onclick="restartBrowser()"><i class="fas fa-redo"></i> Restart</button>
+                    <div style="margin-top:15px; display:grid; gap:8px">
+                        <button class="btn btn-s" onclick="saveState()"><i class="fas fa-save"></i> Manual Sync</button>
+                        <button class="btn btn-d" onclick="relaunch()"><i class="fas fa-power-off"></i> Hard Restart</button>
                     </div>
                 </div>
 
                 <div class="card">
-                    <h2><i class="fas fa-terminal"></i> Activity Logs</h2>
-                    <div id="logBox" class="log-box"></div>
-                    <button class="btn btn-s" onclick="clearLogs()" style="width: 100%; margin-top: 10px;">Clear Logs</button>
+                    <h3><i class="fas fa-terminal"></i> Activity</h3>
+                    <div id="logs" class="log-box"></div>
                 </div>
             </aside>
         </div>
     </div>
 
     <script>
-        let currentTasks = [];
-        let selectedTabIdx = null;
+        const log = (msg, isErr = false) => {
+            const l = document.getElementById('logs');
+            const d = document.createElement('div');
+            d.style.color = isErr ? '#f87171' : '#10b981';
+            d.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            l.appendChild(d);
+            l.scrollTop = l.scrollHeight;
+        };
 
-        function addLog(msg, type='info') {
-            const logBox = document.getElementById('logBox');
-            const time = new Date().toLocaleTimeString();
-            const div = document.createElement('div');
-            div.className = 'log-entry';
-            div.innerHTML = `<span class="log-time">[${time}]</span> <span style="color: ${type==='error'?'#f87171':(type==='success'?'#4ade80':'#38bdf8')}">${msg}</span>`;
-            logBox.appendChild(div);
-            logBox.scrollTop = logBox.scrollHeight;
-        }
-
-        async function api(path, method='GET', body=null) {
-            document.getElementById('topLoader').style.display = 'block';
+        async function refresh() {
             try {
-                const options = { method, headers: {'Content-Type': 'application/json'} };
-                if(body) options.body = JSON.stringify(body);
-                const res = await fetch(path, options);
-                return await res.json();
-            } catch(e) {
-                addLog('API Error: ' + e.message, 'error');
-                return { success: false };
-            } finally {
-                document.getElementById('topLoader').style.display = 'none';
-            }
-        }
+                const r = await fetch('/status');
+                const d = await r.json();
+                
+                const bs = document.getElementById('bStatus');
+                bs.className = `status-badge ${d.alive ? 'alive' : 'dead'}`;
+                bs.textContent = d.alive ? 'BROWSER ONLINE' : 'ENGINE RESTARTING';
+                
+                document.getElementById('mem').textContent = d.memory;
+                document.getElementById('uptime').textContent = d.uptime;
 
-        async function updateStatus() {
-            const data = await api('/status');
-            if(!data) return;
-
-            document.getElementById('bState').textContent = data.browser_ready ? 'ONLINE' : 'CRASHED';
-            document.getElementById('bState').style.color = data.browser_ready ? '#10b981' : '#ef4444';
-            
-            document.getElementById('memText').textContent = `${data.memory_usage} / 512 MB`;
-            document.getElementById('memBar').style.width = Math.min((data.memory_usage / 512) * 100, 100) + '%';
-            document.getElementById('tabCount').textContent = data.tasks.length;
-
-            const list = document.getElementById('taskList');
-            list.innerHTML = '';
-            currentTasks = data.tasks;
-
-            data.tasks.forEach((task, idx) => {
-                const item = document.createElement('div');
-                item.className = 'task-item';
-                item.innerHTML = `
-                    <div class="task-info">
-                        <div style="font-weight: bold; font-size: 0.9rem;">Tab #${idx + 1}</div>
-                        <div class="task-url">${task.url}</div>
-                        <div class="task-status ${task.running ? 'status-running' : 'status-stopped'}">
-                            <i class="fas fa-${task.running?'sync fa-spin':'pause'}"></i> ${task.running ? 'Automating' : 'Stopped'}
+                const list = document.getElementById('taskList');
+                list.innerHTML = '';
+                d.tasks.forEach((t, i) => {
+                    const item = document.createElement('div');
+                    item.className = 'task-item';
+                    item.innerHTML = `
+                        <div style="flex:1">
+                            <div style="font-size:11px; color:${t.running?'#4ade80':'#94a3b8'}">${t.running?'● RUNNING':'● STOPPED'}</div>
+                            <div class="task-url">${t.url}</div>
                         </div>
-                    </div>
-                    <div style="display: flex; gap: 8px;">
-                        <button class="btn btn-s" onclick="viewTab(${idx})"><i class="fas fa-eye"></i></button>
-                        <button class="btn ${task.running ? 'btn-d' : 'btn-p'}" onclick="toggleTask(${idx})">
-                            <i class="fas fa-${task.running ? 'stop' : 'play'}"></i>
-                        </button>
-                        <button class="btn btn-s" onclick="removeTask(${idx})" style="color: #ef4444;"><i class="fas fa-trash"></i></button>
-                    </div>
-                `;
-                list.appendChild(item);
-            });
+                        <div style="display:flex; gap:5px">
+                            <button class="btn btn-s" onclick="view(${i})"><i class="fas fa-eye"></i></button>
+                            <button class="btn ${t.running?'btn-d':'btn-p'}" onclick="toggle(${i})"><i class="fas fa-${t.running?'stop':'play'}"></i></button>
+                            <button class="btn btn-s" onclick="remove(${i})"><i class="fas fa-trash text-red-400"></i></button>
+                        </div>
+                    `;
+                    list.appendChild(item);
+                });
+            } catch(e) {}
         }
 
         async function addTask() {
             const url = document.getElementById('colabUrl').value;
             if(!url) return;
-            const res = await api('/tasks', 'POST', { url });
-            if(res.success) {
-                addLog('Added new automation tab', 'success');
-                document.getElementById('colabUrl').value = '';
-                updateStatus();
+            await fetch('/tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url})});
+            document.getElementById('colabUrl').value = '';
+            log("New tab added to session");
+            refresh();
+        }
+
+        async function toggle(i) { await fetch(`/tasks/${i}/toggle`, {method:'POST'}); refresh(); }
+        async function remove(i) { await fetch(`/tasks/${i}`, {method:'DELETE'}); refresh(); }
+        async function saveState() { await fetch('/sync', {method:'POST'}); log("Session storage state synced!"); }
+        async function relaunch() { log("Hard relaunching engine...", true); await fetch('/relaunch', {method:'POST'}); }
+
+        async function view(i) {
+            const r = await fetch(`/tasks/${i}/screenshot`);
+            const d = await r.json();
+            if(d.success) {
+                document.getElementById('ssCard').style.display = 'block';
+                document.getElementById('preview').src = `/screenshots/${d.file}?t=${Date.now()}`;
             }
         }
 
-        async function toggleTask(idx) {
-            await api(`/tasks/${idx}/toggle`, 'POST');
-            updateStatus();
-        }
-
-        async function removeTask(idx) {
-            if(!confirm('Delete this automation tab?')) return;
-            await api(`/tasks/${idx}`, 'DELETE');
-            updateStatus();
-        }
-
-        async function viewTab(idx) {
-            selectedTabIdx = idx;
-            const preview = document.getElementById('previewBox');
-            preview.innerHTML = '<i class="fas fa-spinner fa-spin fa-2x" style="color: #6366f1;"></i>';
-            const res = await api(`/tasks/${idx}/screenshot`);
-            if(res.success) {
-                preview.innerHTML = `<img src="/screenshots/${res.filename}?t=${Date.now()}" alt="Preview">`;
-            } else {
-                preview.innerHTML = '<p>Failed to capture screenshot</p>';
-            }
-        }
-
-        async function refreshCookies() {
-            const res = await api('/cookies/refresh', 'POST');
-            if(res.success) addLog(`Cookies updated: ${res.count} items`, 'success');
-        }
-
-        async function restartBrowser() {
-            addLog('Force restarting browser context...', 'error');
-            await api('/browser/restart', 'POST');
-            setTimeout(updateStatus, 3000);
-        }
-
-        function clearLogs() { document.getElementById('logBox').innerHTML = ''; }
-
-        setInterval(updateStatus, 5000);
-        window.onload = () => {
-            addLog('System Initialized. Koyeb RAM Protection Active.');
-            updateStatus();
-        };
+        setInterval(refresh, 5000);
+        window.onload = refresh;
     </script>
 </body>
 </html>
 EOF
 
-# --- PYTHON BACKEND (main.py) ---
+# --- BACKEND SYSTEM ---
 RUN cat > main.py << 'EOF'
 import asyncio
 import os
-import time
-import uuid
-import logging
 import psutil
+import logging
 import requests
-from datetime import datetime
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-from fastapi.templating import Jinja2Templates
+import json
+import time
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from playwright.async_api import async_playwright
 
-# Setup Clean Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-logger = logging.getLogger("ColabBot")
+# Strict Logging for Koyeb
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("Bot")
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
+os.makedirs("screenshots", exist_ok=True)
 app.mount("/screenshots", StaticFiles(directory="screenshots"), name="screenshots")
 
-# Persistent State
-class GlobalState:
+class SessionManager:
     def __init__(self):
         self.pw = None
         self.browser = None
         self.context = None
-        self.tasks = [] # List of dict: {"url": str, "page": Page, "running": bool}
-        self.cookies = []
-        self.lock = asyncio.Lock() # Prevents overlapping keypresses
-        self.is_restarting = False
-        self.cookies_url = "https://drive.usercontent.google.com/download?id=1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm&export=download"
+        self.tasks = [] 
+        self.lock = asyncio.Lock()
+        self.is_busy = False
+        self.start_time = time.time()
+        self.storage_state = None # THE SECRET: Latest session data saved in RAM
+        self.cookie_url = "https://drive.usercontent.google.com/download?id=1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm&export=download"
 
-state = GlobalState()
+    def parse_netscape(self, text):
+        cookies = []
+        for line in text.splitlines():
+            if not line.strip() or line.startswith('#'): continue
+            p = line.split('\t')
+            if len(p) >= 7:
+                cookies.append({
+                    "name": p[5], "value": p[6], "domain": p[0],
+                    "path": p[2], "secure": p[3].lower() == "true"
+                })
+        return cookies
 
-def parse_netscape(content):
-    cookies = []
-    for line in content.splitlines():
-        if not line.strip() or line.startswith('#'): continue
-        p = line.split('\t')
-        if len(p) >= 7:
-            cookies.append({
-                "name": p[5], "value": p[6], "domain": p[0],
-                "path": p[2], "secure": p[3].lower() == "true"
-            })
-    return cookies
-
-async def get_mem():
-    process = psutil.Process(os.getpid())
-    mem = process.memory_info().rss / (1024 * 1024)
-    for child in process.children(recursive=True):
-        try: mem += child.memory_info().rss / (1024 * 1024)
-        except: pass
-    return round(mem, 1)
-
-async def init_browser():
-    if state.is_restarting: return
-    state.is_restarting = True
-    try:
-        logger.info(">>> INITIALIZING BROWSER (RAM OPTIMIZED)")
-        # Cleanup
-        if state.context: await state.context.close()
-        if state.browser: await state.browser.close()
-        if state.pw: await state.pw.stop()
-
-        # Download Cookies
-        try:
-            r = requests.get(state.cookies_url, timeout=10)
-            if r.status_code == 200:
-                state.cookies = parse_netscape(r.text)
-                logger.info(f"Loaded {len(state.cookies)} cookies")
-        except Exception as e:
-            logger.error(f"Cookie load failed: {e}")
-
-        state.pw = await async_playwright().start()
-        state.browser = await state.pw.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
-                '--js-flags="--max-old-space-size=256"', # Limit JS Heap
-                '--disable-extensions', '--no-zygote', '--single-process'
-            ]
-        )
-        state.context = await state.browser.new_context(
-            viewport={'width': 1280, 'height': 720},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+    async def launch(self):
+        """Launches browser. Uses saved state if available, else original cookies."""
+        if self.is_busy: return
+        self.is_busy = True
         
-        if state.cookies:
-            await state.context.add_cookies(state.cookies)
+        try:
+            logger.info(">>> ENGINE: INITIATING")
+            if self.context: await self.context.close()
+            if self.browser: await self.browser.close()
+            if self.pw: await self.pw.stop()
 
-        # Restore Tabs if any
-        for task in state.tasks:
-            task["page"] = await state.context.new_page()
-            try:
-                await task["page"].goto(task["url"], wait_until="domcontentloaded", timeout=60000)
-            except: pass
+            self.pw = await async_playwright().start()
+            self.browser = await self.pw.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
+                    '--js-flags="--max-old-space-size=128"', # Ultra strict RAM limit
+                    '--disable-extensions', '--no-zygote', '--single-process'
+                ]
+            )
             
-        logger.info(">>> BROWSER SYSTEM ONLINE")
-    except Exception as e:
-        logger.error(f"Browser Init Error: {e}")
-    finally:
-        state.is_restarting = False
+            # SESSION RESTORATION LOGIC
+            if self.storage_state:
+                # Use the latest session state (Cookies + LocalStorage) captured before crash
+                logger.info(">>> ENGINE: RESTORING FROM LAST KNOWN STATE (SAVES LOGIN)")
+                self.context = await self.browser.new_context(
+                    storage_state=self.storage_state,
+                    viewport={'width': 1280, 'height': 720}
+                )
+            else:
+                # First time use: Load original cookies
+                logger.info(">>> ENGINE: FIRST RUN - LOADING ORIGINAL COOKIES")
+                self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
+                try:
+                    r = requests.get(self.cookie_url, timeout=10)
+                    cookies = self.parse_netscape(r.text)
+                    await self.context.add_cookies(cookies)
+                except: logger.error("!!! ENGINE: FAILED TO LOAD SEED COOKIES")
+
+            # Re-open all tabs
+            for task in self.tasks:
+                task["page"] = await self.context.new_page()
+                try: await task["page"].goto(task["url"], wait_until="domcontentloaded", timeout=60000)
+                except: pass
+            
+            logger.info(">>> ENGINE: ONLINE")
+        except Exception as e:
+            logger.error(f"!!! ENGINE: CRITICAL FAILURE: {e}")
+        finally:
+            self.is_busy = False
+
+    async def sync_state(self):
+        """Captures current session state so we don't need 'one-time' cookies again."""
+        if self.context:
+            try:
+                self.storage_state = await self.context.storage_state()
+            except: pass
+
+mgr = SessionManager()
 
 async def watchdog():
-    """Health check every 20 seconds."""
+    """Monitors RAM and connectivity. Proactively saves state."""
     while True:
-        await asyncio.sleep(20)
-        if not state.is_restarting:
-            try:
-                if not state.browser or not state.browser.is_connected():
-                    logger.info("!!! HEALTH CHECK FAILED: RESTARTING")
-                    await init_browser()
-            except:
-                await init_browser()
-
-async def automation_loop():
-    """Runs every 5 mins for each active tab."""
-    while True:
-        await asyncio.sleep(300) # 5 Minute Interval
-        if state.is_restarting or not state.context: continue
+        await asyncio.sleep(60) # Sync every minute
+        if mgr.is_busy: continue
         
-        for task in state.tasks:
+        # 1. Capture current session state (Prevents logout if crash happens)
+        await mgr.sync_state()
+        
+        # 2. Check Browser Health
+        if not mgr.browser or not mgr.browser.is_connected():
+            logger.info("!!! WATCHDOG: DETECTED CRASH - AUTO-RESTORE INITIATED")
+            await mgr.launch()
+            continue
+
+        # 3. RAM Guard (Proactive Cleanup)
+        proc = psutil.Process(os.getpid())
+        mem = proc.memory_info().rss / (1024*1024)
+        for c in proc.children(recursive=True):
+            try: mem += c.memory_info().rss / (1024*1024)
+            except: pass
+            
+        if mem > 400: # 80% of 512MB
+            logger.info(f"!!! WATCHDOG: HIGH RAM ({int(mem)}MB) - SAVING SESSION AND CYCLING")
+            await mgr.launch() # Relaunch will use the state we just synced
+
+async def automation():
+    """One-by-one keypress for each tab."""
+    while True:
+        await asyncio.sleep(300)
+        if mgr.is_busy or not mgr.context: continue
+        
+        for idx, task in enumerate(mgr.tasks):
             if task["running"] and task["page"]:
-                async with state.lock: # Anti-collision Lock
+                async with mgr.lock:
                     try:
                         p = task["page"]
-                        logger.info(f"Keep-alive: {task['url'][:40]}")
+                        logger.info(f"KEEP-ALIVE: Tab #{idx+1}")
                         await p.bring_to_front()
-                        await p.focus('body')
                         await p.keyboard.down('Control')
                         await p.keyboard.press('Enter')
                         await p.keyboard.up('Control')
-                        await asyncio.sleep(3) # Wait for execution to start
-                    except Exception as e:
-                        logger.error(f"Tab automation error: {e}")
+                        await asyncio.sleep(5) 
+                    except: pass
 
 @app.on_event("startup")
-async def on_start():
-    asyncio.create_task(init_browser())
+async def start():
+    asyncio.create_task(mgr.launch())
     asyncio.create_task(watchdog())
-    asyncio.create_task(automation_loop())
+    asyncio.create_task(automation())
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
@@ -419,78 +356,63 @@ async def home(request: Request):
 
 @app.get("/status")
 async def get_status():
+    proc = psutil.Process(os.getpid())
+    mem = proc.memory_info().rss / (1024*1024)
+    for c in proc.children(recursive=True):
+        try: mem += c.memory_info().rss / (1024*1024)
+        except: pass
+    uptime = int((time.time() - mgr.start_time) / 60)
     return {
-        "browser_ready": state.browser.is_connected() if state.browser else False,
-        "memory_usage": await get_mem(),
-        "tasks": [{"url": t["url"], "running": t["running"]} for t in state.tasks]
+        "alive": mgr.browser.is_connected() if mgr.browser else False,
+        "memory": int(mem),
+        "uptime": uptime,
+        "tasks": [{"url": t["url"], "running": t["running"]} for t in mgr.tasks]
     }
 
 @app.post("/tasks")
 async def add_task(request: Request):
     data = await request.json()
     url = data.get("url")
-    if not url: return {"success": False}
-    
-    if not state.context: await init_browser()
-    
-    page = await state.context.new_page()
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    except Exception as e:
-        logger.warning(f"Initial navigation slow: {e}")
-
-    state.tasks.append({"url": url, "page": page, "running": True})
+    if not url or not mgr.context: return {"success": False}
+    pg = await mgr.context.new_page()
+    try: await pg.goto(url, wait_until="domcontentloaded", timeout=60000)
+    except: pass
+    mgr.tasks.append({"url": url, "page": pg, "running": True})
     return {"success": True}
 
 @app.post("/tasks/{idx}/toggle")
-async def toggle_task(idx: int):
-    if 0 <= idx < len(state.tasks):
-        state.tasks[idx]["running"] = not state.tasks[idx]["running"]
-        return {"success": True}
-    return {"success": False}
+async def toggle(idx: int):
+    if 0 <= idx < len(mgr.tasks):
+        mgr.tasks[idx]["running"] = not mgr.tasks[idx]["running"]
+    return {"success": True}
 
 @app.delete("/tasks/{idx}")
-async def delete_task(idx: int):
-    if 0 <= idx < len(state.tasks):
-        task = state.tasks.pop(idx)
-        try: await task["page"].close()
+async def remove(idx: int):
+    if 0 <= idx < len(mgr.tasks):
+        t = mgr.tasks.pop(idx)
+        try: await t["page"].close()
         except: pass
-        return {"success": True}
-    return {"success": False}
+    return {"success": True}
 
 @app.get("/tasks/{idx}/screenshot")
-async def get_ss(idx: int):
-    if 0 <= idx < len(state.tasks):
-        page = state.tasks[idx]["page"]
-        fname = f"ss_{idx}_{int(time.time())}.png"
-        fpath = f"screenshots/{fname}"
+async def ss(idx: int):
+    if 0 <= idx < len(mgr.tasks):
+        name = f"ss_{idx}.png"
+        path = f"screenshots/{name}"
         try:
-            # Clean old screenshots first
-            for f in os.listdir("screenshots"):
-                if f.startswith(f"ss_{idx}_"): os.remove(f"screenshots/{f}")
-            
-            await page.screenshot(path=fpath)
-            return {"success": True, "filename": fname}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+            await mgr.tasks[idx]["page"].screenshot(path=path)
+            return {"success": True, "file": name}
+        except: pass
     return {"success": False}
 
-@app.post("/cookies/refresh")
-async def refresh_cookies():
-    try:
-        r = requests.get(state.cookies_url, timeout=10)
-        if r.status_code == 200:
-            state.cookies = parse_netscape(r.text)
-            if state.context:
-                await state.context.clear_cookies()
-                await state.context.add_cookies(state.cookies)
-            return {"success": True, "count": len(state.cookies)}
-    except: pass
-    return {"success": False}
+@app.post("/sync")
+async def sync():
+    await mgr.sync_state()
+    return {"success": True}
 
-@app.post("/browser/restart")
-async def restart_browser():
-    asyncio.create_task(init_browser())
+@app.post("/relaunch")
+async def relaunch():
+    asyncio.create_task(mgr.launch())
     return {"success": True}
 
 if __name__ == "__main__":
@@ -498,9 +420,5 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), log_level="warning")
 EOF
 
-# Expose port
 EXPOSE 8000
-
-# Start command
 CMD ["python", "main.py"]
-
