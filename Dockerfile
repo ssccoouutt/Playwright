@@ -297,13 +297,27 @@ class SessionManager:
             self.is_busy = False
 
     async def sync_state(self):
-        """Saves current session state to memory."""
+        """Saves current session state to memory with timeout protection."""
         if self.context:
             try:
-                self.storage_state = await self.context.storage_state()
+                # Use a timeout to prevent hanging with multiple tabs
+                self.storage_state = await asyncio.wait_for(
+                    self.context.storage_state(),
+                    timeout=10.0  # 10 second timeout instead of default 30
+                )
                 size_kb = len(json.dumps(self.storage_state)) // 1024
                 logger.info(f"STATE SYNCED: {size_kb} KB")
                 return size_kb
+            except asyncio.TimeoutError:
+                logger.warning("STATE SYNC: Timeout - using partial state")
+                # Try to get basic cookies if full state times out
+                try:
+                    cookies = await self.context.cookies()
+                    self.storage_state = {"cookies": cookies, "origins": []}
+                    size_kb = len(json.dumps(self.storage_state)) // 1024
+                    return size_kb
+                except:
+                    logger.error("STATE SYNC: Failed to get cookies")
             except Exception as e:
                 logger.error(f"Sync failed: {e}")
         return 0
