@@ -265,12 +265,30 @@ class SessionManager:
                 except Exception as e:
                     logger.error(f"!!! COOKIE FETCH FAILED: {e}")
 
-            for task in self.tasks:
-                task["page"] = await self.context.new_page()
-                try: 
-                    await task["page"].goto(task["url"], wait_until="domcontentloaded", timeout=60000)
-                except: 
-                    pass
+            # FIXED SECTION: Recreate pages for all tasks in order
+            for idx, task in enumerate(self.tasks):
+                try:
+                    # Close old page reference if it exists (but should be closed already)
+                    if task.get("page"):
+                        try:
+                            await task["page"].close()
+                        except:
+                            pass
+                    
+                    # Create new page
+                    new_page = await self.context.new_page()
+                    self.tasks[idx]["page"] = new_page
+                    
+                    try: 
+                        await new_page.goto(task["url"], wait_until="domcontentloaded", timeout=60000)
+                        logger.info(f">>> ENGINE: Tab #{idx+1} restored")
+                    except Exception as e:
+                        logger.error(f">>> ENGINE: Tab #{idx+1} failed to load: {e}")
+                        pass
+                except Exception as e:
+                    logger.error(f">>> ENGINE: Failed to restore tab #{idx+1}: {e}")
+                    # Keep the task but mark page as None
+                    self.tasks[idx]["page"] = None
             
             logger.info(">>> ENGINE: ONLINE")
         except Exception as e:
@@ -307,18 +325,26 @@ async def automation():
         await asyncio.sleep(300)
         if mgr.is_busy or not mgr.context: continue
         
+        # FIXED SECTION: Check if page is still valid before using it
         for idx, task in enumerate(mgr.tasks):
-            if task["running"] and task["page"]:
+            if task["running"] and task.get("page"):
                 async with mgr.lock:
                     try:
                         logger.info(f"KEEP-ALIVE: Tab #{idx+1}")
                         p = task["page"]
+                        
+                        # Check if page is still valid
+                        if p.is_closed():
+                            logger.warning(f"Tab #{idx+1} is closed, skipping")
+                            continue
+                            
                         await p.bring_to_front()
                         await p.keyboard.down('Control')
                         await p.keyboard.press('Enter')
                         await p.keyboard.up('Control')
                         await asyncio.sleep(2) 
-                    except: pass
+                    except Exception as e:
+                        logger.warning(f"KEEP-ALIVE failed for Tab #{idx+1}: {e}")
 
 @app.on_event("startup")
 async def start():
