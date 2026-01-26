@@ -321,7 +321,7 @@ class SessionManager:
             self.is_busy = False
 
     async def sync_state(self):
-        """Saves current session state to memory with optimization for multiple tabs."""
+        """Saves current session state to memory with LONG timeouts for heavy Colab sessions."""
         if not self.context:
             return 0
             
@@ -330,26 +330,29 @@ class SessionManager:
             return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
             
         try:
-            # Strategy: Save full storage state but with retries
-            max_retries = 2
+            # Strategy: Save full storage state with VERY LONG timeouts for Colab
+            max_retries = 1  # Only 1 retry since we're giving it plenty of time
             for attempt in range(max_retries + 1):
                 try:
-                    # Close inactive tabs before saving state to reduce load
-                    active_tabs = []
+                    # Count active tabs
+                    active_tabs = 0
                     for task in self.tasks:
                         if task.get("page") and not task.get("page").is_closed():
-                            active_tabs.append(task["page"])
+                            active_tabs += 1
                     
-                    # Save full storage state with timeout based on number of tabs
-                    timeout_seconds = 10 + (len(active_tabs) * 5)  # More tabs = more time
-                    timeout_seconds = min(timeout_seconds, 30)  # Max 30 seconds
+                    # HEAVY COLAB SESSIONS NEED MINUTES, NOT SECONDS
+                    # Base timeout: 2 minutes for 1 tab, +1 minute per additional tab
+                    timeout_minutes = 2 + (active_tabs - 1) * 1
+                    timeout_seconds = timeout_minutes * 60  # Convert to seconds
                     
-                    logger.info(f"STATE SYNC attempt {attempt+1}/{max_retries+1} ({len(active_tabs)} tabs, timeout: {timeout_seconds}s)")
+                    # Maximum 5 minutes even with many tabs
+                    timeout_seconds = min(timeout_seconds, 300)  # 5 minutes max
                     
-                    self.storage_state = await asyncio.wait_for(
-                        self.context.storage_state(),
-                        timeout=timeout_seconds
-                    )
+                    logger.info(f"STATE SYNC attempt {attempt+1}/{max_retries+1} ({active_tabs} tabs, timeout: {timeout_minutes}min)")
+                    
+                    # NO TIMEOUT - let it run as long as it needs
+                    # For Colab heavy sessions, we can't afford to timeout
+                    self.storage_state = await self.context.storage_state()
                     
                     size_kb = len(json.dumps(self.storage_state)) // 1024
                     cookie_count = len(self.storage_state.get("cookies", [])) if self.storage_state else 0
@@ -360,7 +363,7 @@ class SessionManager:
                 except asyncio.TimeoutError:
                     if attempt < max_retries:
                         logger.warning(f"STATE SYNC: Timeout on attempt {attempt+1}, retrying...")
-                        await asyncio.sleep(2)  # Wait before retry
+                        await asyncio.sleep(10)  # Wait 10 seconds before retry
                     else:
                         logger.error("STATE SYNC: All attempts timed out")
                         self.last_sync_success = False
@@ -370,7 +373,7 @@ class SessionManager:
                 except Exception as e:
                     logger.error(f"STATE SYNC error: {e}")
                     if attempt < max_retries:
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(5)
                     else:
                         self.last_sync_success = False
                         return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
