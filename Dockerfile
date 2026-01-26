@@ -210,7 +210,6 @@ class SessionManager:
         self.is_busy = False
         self.storage_state = None 
         self.cookie_url = "https://drive.usercontent.google.com/download?id=1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm&export=download"
-        self.last_sync_success = True
 
     def parse_netscape(self, text):
         cookies = []
@@ -251,31 +250,10 @@ class SessionManager:
             
             if self.storage_state:
                 logger.info(f">>> ENGINE: RESTORING SAVED SESSION...")
-                try:
-                    self.context = await self.browser.new_context(
-                        storage_state=self.storage_state,
-                        viewport={'width': 1280, 'height': 720}
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to restore full state: {e}, trying fallback...")
-                    # Fallback 1: Try with just cookies
-                    try:
-                        self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
-                        if self.storage_state and "cookies" in self.storage_state:
-                            await self.context.add_cookies(self.storage_state["cookies"])
-                        logger.info("Fallback 1: Restored cookies only")
-                    except Exception as e2:
-                        logger.error(f"Fallback 1 failed: {e2}")
-                        # Fallback 2: Clean context with seed cookies
-                        self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
-                        try:
-                            r = requests.get(self.cookie_url, timeout=10)
-                            if r.status_code == 200:
-                                cookies = self.parse_netscape(r.text)
-                                await self.context.add_cookies(cookies)
-                        except:
-                            pass
-                        logger.info("Fallback 2: Clean context created")
+                self.context = await self.browser.new_context(
+                    storage_state=self.storage_state,
+                    viewport={'width': 1280, 'height': 720}
+                )
             else:
                 logger.info(">>> ENGINE: NO SAVED STATE - LOADING SEED COOKIES")
                 self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
@@ -287,102 +265,48 @@ class SessionManager:
                 except Exception as e:
                     logger.error(f"!!! COOKIE FETCH FAILED: {e}")
 
-            # FIXED SECTION: Recreate pages for all tasks in order
-            for idx, task in enumerate(self.tasks):
-                try:
-                    # Close old page reference if it exists (but should be closed already)
-                    if task.get("page"):
-                        try:
-                            await task["page"].close()
-                        except:
-                            pass
-                    
-                    # Create new page
-                    new_page = await self.context.new_page()
-                    self.tasks[idx]["page"] = new_page
-                    
-                    try: 
-                        await new_page.goto(task["url"], wait_until="domcontentloaded", timeout=60000)
-                        logger.info(f">>> ENGINE: Tab #{idx+1} restored")
-                    except Exception as e:
-                        logger.error(f">>> ENGINE: Tab #{idx+1} failed to load: {e}")
-                        pass
-                except Exception as e:
-                    logger.error(f">>> ENGINE: Failed to restore tab #{idx+1}: {e}")
-                    # Keep the task but mark page as None
-                    self.tasks[idx]["page"] = None
+            for task in self.tasks:
+                task["page"] = await self.context.new_page()
+                try: 
+                    await task["page"].goto(task["url"], wait_until="domcontentloaded", timeout=60000)
+                except: 
+                    pass
             
             logger.info(">>> ENGINE: ONLINE")
-            self.last_sync_success = True
         except Exception as e:
             logger.error(f"!!! CRITICAL FAILURE: {e}")
-            self.last_sync_success = False
         finally:
             self.is_busy = False
 
     async def sync_state(self):
-        """Saves current session state to memory with LONG timeouts for heavy Colab sessions."""
-        if not self.context:
-            return 0
-            
-        # Don't try to sync if last sync failed or we're busy
-        if not self.last_sync_success or self.is_busy:
-            return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
-            
-        try:
-            # Strategy: Save full storage state with VERY LONG timeouts for Colab
-            max_retries = 1  # Only 1 retry since we're giving it plenty of time
-            for attempt in range(max_retries + 1):
+        """Saves current session state to memory with extended timeout."""
+        if self.context:
+            try:
+                # Increase timeout to 5 minutes (300 seconds) for multiple tabs
+                active_tabs = sum(1 for t in self.tasks if t["running"])
+                timeout_seconds = 300  # 5 minutes for multiple tabs
+                
+                logger.info(f"SYNCING STATE: {active_tabs} active tabs, timeout={timeout_seconds}s")
+                
+                # Use asyncio.wait_for to set explicit timeout
                 try:
-                    # Count active tabs
-                    active_tabs = 0
-                    for task in self.tasks:
-                        if task.get("page") and not task.get("page").is_closed():
-                            active_tabs += 1
-                    
-                    # HEAVY COLAB SESSIONS NEED MINUTES, NOT SECONDS
-                    # Base timeout: 2 minutes for 1 tab, +1 minute per additional tab
-                    timeout_minutes = 2 + (active_tabs - 1) * 1
-                    timeout_seconds = timeout_minutes * 60  # Convert to seconds
-                    
-                    # Maximum 5 minutes even with many tabs
-                    timeout_seconds = min(timeout_seconds, 300)  # 5 minutes max
-                    
-                    logger.info(f"STATE SYNC attempt {attempt+1}/{max_retries+1} ({active_tabs} tabs, timeout: {timeout_minutes}min)")
-                    
-                    # NO TIMEOUT - let it run as long as it needs
-                    # For Colab heavy sessions, we can't afford to timeout
-                    self.storage_state = await self.context.storage_state()
-                    
+                    self.storage_state = await asyncio.wait_for(
+                        self.context.storage_state(),
+                        timeout=timeout_seconds
+                    )
                     size_kb = len(json.dumps(self.storage_state)) // 1024
-                    cookie_count = len(self.storage_state.get("cookies", [])) if self.storage_state else 0
-                    logger.info(f"STATE SYNCED: {size_kb} KB ({cookie_count} cookies)")
-                    self.last_sync_success = True
+                    logger.info(f"STATE SYNCED: {size_kb} KB")
                     return size_kb
-                    
                 except asyncio.TimeoutError:
-                    if attempt < max_retries:
-                        logger.warning(f"STATE SYNC: Timeout on attempt {attempt+1}, retrying...")
-                        await asyncio.sleep(10)  # Wait 10 seconds before retry
-                    else:
-                        logger.error("STATE SYNC: All attempts timed out")
-                        self.last_sync_success = False
-                        # Keep old state if sync fails
-                        return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
-                        
-                except Exception as e:
-                    logger.error(f"STATE SYNC error: {e}")
-                    if attempt < max_retries:
-                        await asyncio.sleep(5)
-                    else:
-                        self.last_sync_success = False
-                        return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
-                        
-        except Exception as e:
-            logger.error(f"STATE SYNC unexpected error: {e}")
-            self.last_sync_success = False
-            
-        return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
+                    logger.error(f"!!! STATE SYNC TIMEOUT: Exceeded {timeout_seconds} seconds")
+                    # Return partial state if available, or keep old state
+                    return 0
+                    
+            except Exception as e:
+                logger.error(f"Sync failed: {e}")
+                # Don't overwrite existing state on error
+                return 0
+        return 0
 
 mgr = SessionManager()
 
@@ -401,26 +325,18 @@ async def automation():
         await asyncio.sleep(300)
         if mgr.is_busy or not mgr.context: continue
         
-        # FIXED SECTION: Check if page is still valid before using it
         for idx, task in enumerate(mgr.tasks):
-            if task["running"] and task.get("page"):
+            if task["running"] and task["page"]:
                 async with mgr.lock:
                     try:
                         logger.info(f"KEEP-ALIVE: Tab #{idx+1}")
                         p = task["page"]
-                        
-                        # Check if page is still valid
-                        if p.is_closed():
-                            logger.warning(f"Tab #{idx+1} is closed, skipping")
-                            continue
-                            
                         await p.bring_to_front()
                         await p.keyboard.down('Control')
                         await p.keyboard.press('Enter')
                         await p.keyboard.up('Control')
                         await asyncio.sleep(2) 
-                    except Exception as e:
-                        logger.warning(f"KEEP-ALIVE failed for Tab #{idx+1}: {e}")
+                    except: pass
 
 @app.on_event("startup")
 async def start():
