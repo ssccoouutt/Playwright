@@ -226,18 +226,32 @@ class SessionManager:
 
     async def launch(self):
         """Restores browser engine with saved state to prevent logout."""
-        if self.is_busy: return
+        if self.is_busy: 
+            logger.info(">>> ENGINE: SKIPPING - Already busy")
+            return
+            
+        logger.info(">>> ENGINE: INITIATING RE-LAUNCH")
+        
+        # SYNC STATE BEFORE SETTING BUSY FLAG
+        if self.context:
+            logger.info(">>> PRE-RELAUNCH SYNC: Starting...")
+            await self.sync_state()
+        else:
+            logger.info(">>> PRE-RELAUNCH SYNC: No context to sync")
+        
+        # NOW set busy flag
         self.is_busy = True
         
         try:
-            logger.info(">>> ENGINE: INITIATING RE-LAUNCH")
-            # Sync state one last time before closing if possible
-            if self.context:
-                await self.sync_state()
-
-            if self.context: await self.context.close()
-            if self.browser: await self.browser.close()
-            if self.pw: await self.pw.stop()
+            if self.context: 
+                await self.context.close()
+                logger.info(">>> Context closed")
+            if self.browser: 
+                await self.browser.close()
+                logger.info(">>> Browser closed")
+            if self.pw: 
+                await self.pw.stop()
+                logger.info(">>> Playwright stopped")
 
             self.pw = await async_playwright().start()
             self.browser = await self.pw.chromium.launch(
@@ -321,13 +335,15 @@ class SessionManager:
             self.is_busy = False
 
     async def sync_state(self):
-        """Saves current session state to memory - NO TIMEOUT FOR HEAVY COLAB SESSIONS."""
+        """Saves current session state to memory - ALWAYS logs attempt and result."""
         if not self.context:
+            logger.warning("STATE SYNC: No context available")
             return 0
             
-        # Don't try to sync if last sync failed or we're busy
-        if not self.last_sync_success or self.is_busy:
-            return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
+        # Don't skip sync even if busy - we need to try before relaunch
+        # But log if we were busy
+        if self.is_busy:
+            logger.warning("STATE SYNC: Warning - sync called while busy (but will proceed)")
             
         try:
             # Count active tabs
@@ -338,30 +354,48 @@ class SessionManager:
             
             logger.info(f"STATE SYNC: Starting for {active_tabs} active tabs")
             
-            # CRITICAL FIX: Call storage_state() WITHOUT any timeout wrapper
-            # Playwright's internal timeout is 30s, but for Colab we need longer
-            # We can't override it with asyncio.wait_for() because it's internal to Playwright
-            self.storage_state = await self.context.storage_state()
+            # CRITICAL: Try with multiple retries for multiple tabs
+            max_retries = 3 if active_tabs > 1 else 1
+            last_error = None
             
-            size_kb = len(json.dumps(self.storage_state)) // 1024
-            cookie_count = len(self.storage_state.get("cookies", [])) if self.storage_state else 0
-            logger.info(f"STATE SYNCED: {size_kb} KB ({cookie_count} cookies)")
-            self.last_sync_success = True
-            return size_kb
+            for attempt in range(max_retries):
+                try:
+                    logger.info(f"STATE SYNC: Attempt {attempt+1}/{max_retries}")
+                    
+                    # Direct call - no timeout wrapper
+                    self.storage_state = await self.context.storage_state()
+                    
+                    size_kb = len(json.dumps(self.storage_state)) // 1024
+                    cookie_count = len(self.storage_state.get("cookies", [])) if self.storage_state else 0
+                    logger.info(f"STATE SYNCED SUCCESS: {size_kb} KB ({cookie_count} cookies)")
+                    self.last_sync_success = True
+                    return size_kb
+                    
+                except PlaywrightTimeoutError as e:
+                    last_error = f"Playwright timeout (30s): {e}"
+                    logger.warning(f"STATE SYNC: Timeout attempt {attempt+1}/{max_retries}")
+                    if attempt < max_retries - 1:
+                        wait_time = 5 * (attempt + 1)  # 5, 10, 15 seconds
+                        logger.info(f"STATE SYNC: Retrying in {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        
+                except Exception as e:
+                    last_error = f"{type(e).__name__}: {e}"
+                    logger.error(f"STATE SYNC: Error attempt {attempt+1}/{max_retries}: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(3)
             
-        except PlaywrightTimeoutError:
-            # This is the 30s timeout from Playwright itself
-            logger.error("!!! STATE SYNC TIMEOUT: Playwright's 30s timeout exceeded")
-            logger.error("!!! For multiple Colab tabs, saving state can take >30s")
-            logger.error("!!! Keeping previous state to avoid logout")
-            self.last_sync_success = False
-            # Keep old state if sync fails
-            return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
-            
+            # If all retries failed
+            if last_error:
+                logger.error(f"STATE SYNC FAILED after {max_retries} attempts: {last_error}")
+                logger.warning("STATE SYNC: Keeping previous state")
+                self.last_sync_success = False
+                return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
+                
         except Exception as e:
-            logger.error(f"STATE SYNC error: {e}")
+            logger.error(f"STATE SYNC CRITICAL ERROR: {e}")
             self.last_sync_success = False
-            # Keep old state if sync fails
+            # Try to preserve existing state
             return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
 
 mgr = SessionManager()
@@ -370,9 +404,22 @@ async def watchdog():
     """Relaunches browser every 15 minutes as requested."""
     while True:
         await asyncio.sleep(900) # Exactly 15 minutes
-        if mgr.is_busy: continue
         
         logger.info(">>> WATCHDOG: 15-MIN SCHEDULED RELAUNCH")
+        logger.info(f">>> WATCHDOG: Current busy state = {mgr.is_busy}")
+        
+        # Wait if busy, but only for a reasonable time
+        max_wait = 60  # Maximum 60 seconds to wait
+        waited = 0
+        while mgr.is_busy and waited < max_wait:
+            logger.info(f">>> WATCHDOG: Waiting for busy state... ({waited}s/{max_wait}s)")
+            await asyncio.sleep(5)
+            waited += 5
+        
+        if mgr.is_busy:
+            logger.warning(">>> WATCHDOG: Skipped - system still busy after wait")
+            continue
+            
         await mgr.launch()
 
 async def automation():
@@ -438,6 +485,7 @@ async def add_task(request: Request):
     mgr.tasks.append({"url": url, "page": pg, "running": True})
     
     # Save session immediately when adding a tab
+    logger.info(">>> Auto-sync after adding tab")
     await mgr.sync_state()
     return {"success": True}
 
@@ -455,6 +503,7 @@ async def remove(idx: int):
         except: pass
         
         # Save session immediately when removing a tab (size will decrease)
+        logger.info(">>> Auto-sync after removing tab")
         await mgr.sync_state()
     return {"success": True}
 
@@ -471,6 +520,7 @@ async def ss(idx: int):
 
 @app.post("/relaunch")
 async def relaunch():
+    logger.info(">>> Manual relaunch requested")
     asyncio.create_task(mgr.launch())
     return {"success": True}
 
