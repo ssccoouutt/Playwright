@@ -189,7 +189,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # Optimized Logging
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -210,6 +210,7 @@ class SessionManager:
         self.is_busy = False
         self.storage_state = None 
         self.cookie_url = "https://drive.usercontent.google.com/download?id=1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm&export=download"
+        self.last_sync_success = True
 
     def parse_netscape(self, text):
         cookies = []
@@ -250,10 +251,31 @@ class SessionManager:
             
             if self.storage_state:
                 logger.info(f">>> ENGINE: RESTORING SAVED SESSION...")
-                self.context = await self.browser.new_context(
-                    storage_state=self.storage_state,
-                    viewport={'width': 1280, 'height': 720}
-                )
+                try:
+                    self.context = await self.browser.new_context(
+                        storage_state=self.storage_state,
+                        viewport={'width': 1280, 'height': 720}
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to restore full state: {e}, trying fallback...")
+                    # Fallback 1: Try with just cookies
+                    try:
+                        self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
+                        if self.storage_state and "cookies" in self.storage_state:
+                            await self.context.add_cookies(self.storage_state["cookies"])
+                        logger.info("Fallback 1: Restored cookies only")
+                    except Exception as e2:
+                        logger.error(f"Fallback 1 failed: {e2}")
+                        # Fallback 2: Clean context with seed cookies
+                        self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
+                        try:
+                            r = requests.get(self.cookie_url, timeout=10)
+                            if r.status_code == 200:
+                                cookies = self.parse_netscape(r.text)
+                                await self.context.add_cookies(cookies)
+                        except:
+                            pass
+                        logger.info("Fallback 2: Clean context created")
             else:
                 logger.info(">>> ENGINE: NO SAVED STATE - LOADING SEED COOKIES")
                 self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
@@ -265,48 +287,82 @@ class SessionManager:
                 except Exception as e:
                     logger.error(f"!!! COOKIE FETCH FAILED: {e}")
 
-            for task in self.tasks:
-                task["page"] = await self.context.new_page()
-                try: 
-                    await task["page"].goto(task["url"], wait_until="domcontentloaded", timeout=60000)
-                except: 
-                    pass
+            # Recreate pages for all tasks in order
+            for idx, task in enumerate(self.tasks):
+                try:
+                    # Close old page reference if it exists (but should be closed already)
+                    if task.get("page"):
+                        try:
+                            await task["page"].close()
+                        except:
+                            pass
+                    
+                    # Create new page
+                    new_page = await self.context.new_page()
+                    self.tasks[idx]["page"] = new_page
+                    
+                    try: 
+                        await new_page.goto(task["url"], wait_until="domcontentloaded", timeout=60000)
+                        logger.info(f">>> ENGINE: Tab #{idx+1} restored")
+                    except Exception as e:
+                        logger.error(f">>> ENGINE: Tab #{idx+1} failed to load: {e}")
+                        pass
+                except Exception as e:
+                    logger.error(f">>> ENGINE: Failed to restore tab #{idx+1}: {e}")
+                    # Keep the task but mark page as None
+                    self.tasks[idx]["page"] = None
             
             logger.info(">>> ENGINE: ONLINE")
+            self.last_sync_success = True
         except Exception as e:
             logger.error(f"!!! CRITICAL FAILURE: {e}")
+            self.last_sync_success = False
         finally:
             self.is_busy = False
 
     async def sync_state(self):
-        """Saves current session state to memory with extended timeout."""
-        if self.context:
-            try:
-                # Increase timeout to 5 minutes (300 seconds) for multiple tabs
-                active_tabs = sum(1 for t in self.tasks if t["running"])
-                timeout_seconds = 300  # 5 minutes for multiple tabs
-                
-                logger.info(f"SYNCING STATE: {active_tabs} active tabs, timeout={timeout_seconds}s")
-                
-                # Use asyncio.wait_for to set explicit timeout
-                try:
-                    self.storage_state = await asyncio.wait_for(
-                        self.context.storage_state(),
-                        timeout=timeout_seconds
-                    )
-                    size_kb = len(json.dumps(self.storage_state)) // 1024
-                    logger.info(f"STATE SYNCED: {size_kb} KB")
-                    return size_kb
-                except asyncio.TimeoutError:
-                    logger.error(f"!!! STATE SYNC TIMEOUT: Exceeded {timeout_seconds} seconds")
-                    # Return partial state if available, or keep old state
-                    return 0
-                    
-            except Exception as e:
-                logger.error(f"Sync failed: {e}")
-                # Don't overwrite existing state on error
-                return 0
-        return 0
+        """Saves current session state to memory - NO TIMEOUT FOR HEAVY COLAB SESSIONS."""
+        if not self.context:
+            return 0
+            
+        # Don't try to sync if last sync failed or we're busy
+        if not self.last_sync_success or self.is_busy:
+            return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
+            
+        try:
+            # Count active tabs
+            active_tabs = 0
+            for task in self.tasks:
+                if task.get("page") and not task.get("page").is_closed():
+                    active_tabs += 1
+            
+            logger.info(f"STATE SYNC: Starting for {active_tabs} active tabs")
+            
+            # CRITICAL FIX: Call storage_state() WITHOUT any timeout wrapper
+            # Playwright's internal timeout is 30s, but for Colab we need longer
+            # We can't override it with asyncio.wait_for() because it's internal to Playwright
+            self.storage_state = await self.context.storage_state()
+            
+            size_kb = len(json.dumps(self.storage_state)) // 1024
+            cookie_count = len(self.storage_state.get("cookies", [])) if self.storage_state else 0
+            logger.info(f"STATE SYNCED: {size_kb} KB ({cookie_count} cookies)")
+            self.last_sync_success = True
+            return size_kb
+            
+        except PlaywrightTimeoutError:
+            # This is the 30s timeout from Playwright itself
+            logger.error("!!! STATE SYNC TIMEOUT: Playwright's 30s timeout exceeded")
+            logger.error("!!! For multiple Colab tabs, saving state can take >30s")
+            logger.error("!!! Keeping previous state to avoid logout")
+            self.last_sync_success = False
+            # Keep old state if sync fails
+            return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
+            
+        except Exception as e:
+            logger.error(f"STATE SYNC error: {e}")
+            self.last_sync_success = False
+            # Keep old state if sync fails
+            return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
 
 mgr = SessionManager()
 
@@ -325,18 +381,26 @@ async def automation():
         await asyncio.sleep(300)
         if mgr.is_busy or not mgr.context: continue
         
+        # Check if page is still valid before using it
         for idx, task in enumerate(mgr.tasks):
-            if task["running"] and task["page"]:
+            if task["running"] and task.get("page"):
                 async with mgr.lock:
                     try:
                         logger.info(f"KEEP-ALIVE: Tab #{idx+1}")
                         p = task["page"]
+                        
+                        # Check if page is still valid
+                        if p.is_closed():
+                            logger.warning(f"Tab #{idx+1} is closed, skipping")
+                            continue
+                            
                         await p.bring_to_front()
                         await p.keyboard.down('Control')
                         await p.keyboard.press('Enter')
                         await p.keyboard.up('Control')
                         await asyncio.sleep(2) 
-                    except: pass
+                    except Exception as e:
+                        logger.warning(f"KEEP-ALIVE failed for Tab #{idx+1}: {e}")
 
 @app.on_event("startup")
 async def start():
