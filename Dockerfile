@@ -210,6 +210,7 @@ class SessionManager:
         self.is_busy = False
         self.storage_state = None 
         self.cookie_url = "https://drive.usercontent.google.com/download?id=1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm&export=download"
+        self.last_sync_success = True
 
     def parse_netscape(self, text):
         cookies = []
@@ -250,10 +251,31 @@ class SessionManager:
             
             if self.storage_state:
                 logger.info(f">>> ENGINE: RESTORING SAVED SESSION...")
-                self.context = await self.browser.new_context(
-                    storage_state=self.storage_state,
-                    viewport={'width': 1280, 'height': 720}
-                )
+                try:
+                    self.context = await self.browser.new_context(
+                        storage_state=self.storage_state,
+                        viewport={'width': 1280, 'height': 720}
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to restore full state: {e}, trying fallback...")
+                    # Fallback 1: Try with just cookies
+                    try:
+                        self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
+                        if self.storage_state and "cookies" in self.storage_state:
+                            await self.context.add_cookies(self.storage_state["cookies"])
+                        logger.info("Fallback 1: Restored cookies only")
+                    except Exception as e2:
+                        logger.error(f"Fallback 1 failed: {e2}")
+                        # Fallback 2: Clean context with seed cookies
+                        self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
+                        try:
+                            r = requests.get(self.cookie_url, timeout=10)
+                            if r.status_code == 200:
+                                cookies = self.parse_netscape(r.text)
+                                await self.context.add_cookies(cookies)
+                        except:
+                            pass
+                        logger.info("Fallback 2: Clean context created")
             else:
                 logger.info(">>> ENGINE: NO SAVED STATE - LOADING SEED COOKIES")
                 self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
@@ -291,36 +313,73 @@ class SessionManager:
                     self.tasks[idx]["page"] = None
             
             logger.info(">>> ENGINE: ONLINE")
+            self.last_sync_success = True
         except Exception as e:
             logger.error(f"!!! CRITICAL FAILURE: {e}")
+            self.last_sync_success = False
         finally:
             self.is_busy = False
 
     async def sync_state(self):
-        """Saves current session state to memory with timeout protection."""
-        if self.context:
-            try:
-                # Use a timeout to prevent hanging with multiple tabs
-                self.storage_state = await asyncio.wait_for(
-                    self.context.storage_state(),
-                    timeout=10.0  # 10 second timeout instead of default 30
-                )
-                size_kb = len(json.dumps(self.storage_state)) // 1024
-                logger.info(f"STATE SYNCED: {size_kb} KB")
-                return size_kb
-            except asyncio.TimeoutError:
-                logger.warning("STATE SYNC: Timeout - using partial state")
-                # Try to get basic cookies if full state times out
+        """Saves current session state to memory with optimization for multiple tabs."""
+        if not self.context:
+            return 0
+            
+        # Don't try to sync if last sync failed or we're busy
+        if not self.last_sync_success or self.is_busy:
+            return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
+            
+        try:
+            # Strategy: Save full storage state but with retries
+            max_retries = 2
+            for attempt in range(max_retries + 1):
                 try:
-                    cookies = await self.context.cookies()
-                    self.storage_state = {"cookies": cookies, "origins": []}
+                    # Close inactive tabs before saving state to reduce load
+                    active_tabs = []
+                    for task in self.tasks:
+                        if task.get("page") and not task.get("page").is_closed():
+                            active_tabs.append(task["page"])
+                    
+                    # Save full storage state with timeout based on number of tabs
+                    timeout_seconds = 10 + (len(active_tabs) * 5)  # More tabs = more time
+                    timeout_seconds = min(timeout_seconds, 30)  # Max 30 seconds
+                    
+                    logger.info(f"STATE SYNC attempt {attempt+1}/{max_retries+1} ({len(active_tabs)} tabs, timeout: {timeout_seconds}s)")
+                    
+                    self.storage_state = await asyncio.wait_for(
+                        self.context.storage_state(),
+                        timeout=timeout_seconds
+                    )
+                    
                     size_kb = len(json.dumps(self.storage_state)) // 1024
+                    cookie_count = len(self.storage_state.get("cookies", [])) if self.storage_state else 0
+                    logger.info(f"STATE SYNCED: {size_kb} KB ({cookie_count} cookies)")
+                    self.last_sync_success = True
                     return size_kb
-                except:
-                    logger.error("STATE SYNC: Failed to get cookies")
-            except Exception as e:
-                logger.error(f"Sync failed: {e}")
-        return 0
+                    
+                except asyncio.TimeoutError:
+                    if attempt < max_retries:
+                        logger.warning(f"STATE SYNC: Timeout on attempt {attempt+1}, retrying...")
+                        await asyncio.sleep(2)  # Wait before retry
+                    else:
+                        logger.error("STATE SYNC: All attempts timed out")
+                        self.last_sync_success = False
+                        # Keep old state if sync fails
+                        return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
+                        
+                except Exception as e:
+                    logger.error(f"STATE SYNC error: {e}")
+                    if attempt < max_retries:
+                        await asyncio.sleep(1)
+                    else:
+                        self.last_sync_success = False
+                        return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
+                        
+        except Exception as e:
+            logger.error(f"STATE SYNC unexpected error: {e}")
+            self.last_sync_success = False
+            
+        return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
 
 mgr = SessionManager()
 
