@@ -189,9 +189,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
-# Optimized Logging
+# Minimal Logging - Only important info
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("Bot")
 
@@ -210,7 +210,6 @@ class SessionManager:
         self.is_busy = False
         self.storage_state = None 
         self.cookie_url = "https://drive.usercontent.google.com/download?id=1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm&export=download"
-        self.last_sync_success = True
 
     def parse_netscape(self, text):
         cookies = []
@@ -223,35 +222,43 @@ class SessionManager:
                     "path": p[2], "secure": p[3].lower() == "true"
                 })
         return cookies
+    
+    async def check_google_login(self, page):
+        """Check if Google account is logged in by visiting accounts.google.com"""
+        try:
+            await page.goto("https://accounts.google.com", wait_until="domcontentloaded", timeout=10000)
+            await asyncio.sleep(2)
+            
+            # Check for login page indicators
+            page_text = await page.content()
+            page_url = page.url
+            
+            # If we're redirected to login page or see login forms
+            if "signin" in page_url.lower() or "Sign in" in page_text or "sign in" in page_text.lower():
+                logger.warning("⚠️ GOOGLE LOGGED OUT - Need manual login")
+                return False
+            else:
+                logger.info("✅ Google logged in")
+                return True
+        except Exception as e:
+            logger.warning(f"⚠️ Login check failed: {e}")
+            return False
 
     async def launch(self):
         """Restores browser engine with saved state to prevent logout."""
-        if self.is_busy: 
-            logger.info(">>> ENGINE: SKIPPING - Already busy")
-            return
-            
-        logger.info(">>> ENGINE: INITIATING RE-LAUNCH")
-        
-        # SYNC STATE BEFORE SETTING BUSY FLAG
-        if self.context:
-            logger.info(">>> PRE-RELAUNCH SYNC: Starting...")
-            await self.sync_state()
-        else:
-            logger.info(">>> PRE-RELAUNCH SYNC: No context to sync")
-        
-        # NOW set busy flag
+        if self.is_busy: return
         self.is_busy = True
         
         try:
-            if self.context: 
-                await self.context.close()
-                logger.info(">>> Context closed")
-            if self.browser: 
-                await self.browser.close()
-                logger.info(">>> Browser closed")
-            if self.pw: 
-                await self.pw.stop()
-                logger.info(">>> Playwright stopped")
+            logger.info(">>> ENGINE: INITIATING RE-LAUNCH")
+            
+            # ALWAYS sync state before closing
+            if self.context:
+                await self.sync_state()
+
+            if self.context: await self.context.close()
+            if self.browser: await self.browser.close()
+            if self.pw: await self.pw.stop()
 
             self.pw = await async_playwright().start()
             self.browser = await self.pw.chromium.launch(
@@ -264,162 +271,78 @@ class SessionManager:
             )
             
             if self.storage_state:
-                logger.info(f">>> ENGINE: RESTORING SAVED SESSION...")
+                logger.info(">>> RESTORING SAVED SESSION...")
                 try:
                     self.context = await self.browser.new_context(
                         storage_state=self.storage_state,
                         viewport={'width': 1280, 'height': 720}
                     )
                 except Exception as e:
-                    logger.warning(f"Failed to restore full state: {e}, trying fallback...")
-                    # Fallback 1: Try with just cookies
-                    try:
-                        self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
-                        if self.storage_state and "cookies" in self.storage_state:
-                            await self.context.add_cookies(self.storage_state["cookies"])
-                        logger.info("Fallback 1: Restored cookies only")
-                    except Exception as e2:
-                        logger.error(f"Fallback 1 failed: {e2}")
-                        # Fallback 2: Clean context with seed cookies
-                        self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
-                        try:
-                            r = requests.get(self.cookie_url, timeout=10)
-                            if r.status_code == 200:
-                                cookies = self.parse_netscape(r.text)
-                                await self.context.add_cookies(cookies)
-                        except:
-                            pass
-                        logger.info("Fallback 2: Clean context created")
+                    logger.error(f"❌ Failed to restore state: {e}")
+                    self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
             else:
-                logger.info(">>> ENGINE: NO SAVED STATE - LOADING SEED COOKIES")
+                logger.info(">>> NO SAVED STATE")
                 self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
-                try:
-                    r = requests.get(self.cookie_url, timeout=10)
-                    if r.status_code == 200:
-                        cookies = self.parse_netscape(r.text)
-                        await self.context.add_cookies(cookies)
-                except Exception as e:
-                    logger.error(f"!!! COOKIE FETCH FAILED: {e}")
 
-            # Recreate pages for all tasks in order
+            # Check Google login status
+            check_page = await self.context.new_page()
+            is_logged_in = await self.check_google_login(check_page)
+            await check_page.close()
+            
+            if not is_logged_in:
+                logger.warning("⚠️ ACCOUNT LOGGED OUT - Opening login page")
+                # Create a login page for manual login
+                login_page = await self.context.new_page()
+                await login_page.goto("https://accounts.google.com", wait_until="domcontentloaded")
+                logger.info("⚠️ Please login manually at: https://accounts.google.com")
+                # Keep login page open for manual login
+
+            # Restore all tabs
             for idx, task in enumerate(self.tasks):
                 try:
-                    # Close old page reference if it exists (but should be closed already)
-                    if task.get("page"):
-                        try:
-                            await task["page"].close()
-                        except:
-                            pass
-                    
-                    # Create new page
                     new_page = await self.context.new_page()
                     self.tasks[idx]["page"] = new_page
                     
-                    try: 
-                        await new_page.goto(task["url"], wait_until="domcontentloaded", timeout=60000)
-                        logger.info(f">>> ENGINE: Tab #{idx+1} restored")
-                    except Exception as e:
-                        logger.error(f">>> ENGINE: Tab #{idx+1} failed to load: {e}")
-                        pass
+                    # If not logged in, tabs will redirect to login automatically
+                    await new_page.goto(task["url"], wait_until="domcontentloaded", timeout=60000)
+                    logger.info(f">>> Tab #{idx+1} restored")
                 except Exception as e:
-                    logger.error(f">>> ENGINE: Failed to restore tab #{idx+1}: {e}")
-                    # Keep the task but mark page as None
-                    self.tasks[idx]["page"] = None
+                    logger.warning(f">>> Tab #{idx+1} error: {e}")
             
-            logger.info(">>> ENGINE: ONLINE")
-            self.last_sync_success = True
+            logger.info(">>> ENGINE ONLINE")
         except Exception as e:
-            logger.error(f"!!! CRITICAL FAILURE: {e}")
-            self.last_sync_success = False
+            logger.error(f"❌ CRITICAL FAILURE: {e}")
         finally:
             self.is_busy = False
 
     async def sync_state(self):
-        """Saves current session state to memory - ALWAYS logs attempt and result."""
-        if not self.context:
-            logger.warning("STATE SYNC: No context available")
-            return 0
-            
-        # Don't skip sync even if busy - we need to try before relaunch
-        # But log if we were busy
-        if self.is_busy:
-            logger.warning("STATE SYNC: Warning - sync called while busy (but will proceed)")
-            
-        try:
-            # Count active tabs
-            active_tabs = 0
-            for task in self.tasks:
-                if task.get("page") and not task.get("page").is_closed():
-                    active_tabs += 1
-            
-            logger.info(f"STATE SYNC: Starting for {active_tabs} active tabs")
-            
-            # CRITICAL: Try with multiple retries for multiple tabs
-            max_retries = 3 if active_tabs > 1 else 1
-            last_error = None
-            
-            for attempt in range(max_retries):
-                try:
-                    logger.info(f"STATE SYNC: Attempt {attempt+1}/{max_retries}")
-                    
-                    # Direct call - no timeout wrapper
-                    self.storage_state = await self.context.storage_state()
-                    
-                    size_kb = len(json.dumps(self.storage_state)) // 1024
-                    cookie_count = len(self.storage_state.get("cookies", [])) if self.storage_state else 0
-                    logger.info(f"STATE SYNCED SUCCESS: {size_kb} KB ({cookie_count} cookies)")
-                    self.last_sync_success = True
-                    return size_kb
-                    
-                except PlaywrightTimeoutError as e:
-                    last_error = f"Playwright timeout (30s): {e}"
-                    logger.warning(f"STATE SYNC: Timeout attempt {attempt+1}/{max_retries}")
-                    if attempt < max_retries - 1:
-                        wait_time = 5 * (attempt + 1)  # 5, 10, 15 seconds
-                        logger.info(f"STATE SYNC: Retrying in {wait_time}s...")
-                        await asyncio.sleep(wait_time)
-                        
-                except Exception as e:
-                    last_error = f"{type(e).__name__}: {e}"
-                    logger.error(f"STATE SYNC: Error attempt {attempt+1}/{max_retries}: {e}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(3)
-            
-            # If all retries failed
-            if last_error:
-                logger.error(f"STATE SYNC FAILED after {max_retries} attempts: {last_error}")
-                logger.warning("STATE SYNC: Keeping previous state")
-                self.last_sync_success = False
+        """Saves current session state to memory."""
+        if self.context:
+            try:
+                logger.info(">>> SAVING STATE...")
+                self.storage_state = await asyncio.wait_for(
+                    self.context.storage_state(),
+                    timeout=300.0  # 5 minutes for heavy sessions
+                )
+                size_kb = len(json.dumps(self.storage_state)) // 1024
+                logger.info(f">>> STATE SAVED: {size_kb} KB")
+                return size_kb
+            except asyncio.TimeoutError:
+                logger.error("❌ STATE SAVE TIMEOUT")
                 return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
-                
-        except Exception as e:
-            logger.error(f"STATE SYNC CRITICAL ERROR: {e}")
-            self.last_sync_success = False
-            # Try to preserve existing state
-            return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
+            except Exception as e:
+                logger.error(f"❌ STATE SAVE FAILED: {e}")
+        return 0
 
 mgr = SessionManager()
 
 async def watchdog():
-    """Relaunches browser every 15 minutes as requested."""
+    """Relaunches browser every 15 minutes."""
     while True:
-        await asyncio.sleep(900) # Exactly 15 minutes
+        await asyncio.sleep(900)
+        if mgr.is_busy: continue
         
-        logger.info(">>> WATCHDOG: 15-MIN SCHEDULED RELAUNCH")
-        logger.info(f">>> WATCHDOG: Current busy state = {mgr.is_busy}")
-        
-        # Wait if busy, but only for a reasonable time
-        max_wait = 60  # Maximum 60 seconds to wait
-        waited = 0
-        while mgr.is_busy and waited < max_wait:
-            logger.info(f">>> WATCHDOG: Waiting for busy state... ({waited}s/{max_wait}s)")
-            await asyncio.sleep(5)
-            waited += 5
-        
-        if mgr.is_busy:
-            logger.warning(">>> WATCHDOG: Skipped - system still busy after wait")
-            continue
-            
+        logger.info(">>> SCHEDULED RELAUNCH")
         await mgr.launch()
 
 async def automation():
@@ -428,26 +351,21 @@ async def automation():
         await asyncio.sleep(300)
         if mgr.is_busy or not mgr.context: continue
         
-        # Check if page is still valid before using it
         for idx, task in enumerate(mgr.tasks):
             if task["running"] and task.get("page"):
                 async with mgr.lock:
                     try:
-                        logger.info(f"KEEP-ALIVE: Tab #{idx+1}")
                         p = task["page"]
-                        
-                        # Check if page is still valid
                         if p.is_closed():
-                            logger.warning(f"Tab #{idx+1} is closed, skipping")
                             continue
                             
                         await p.bring_to_front()
                         await p.keyboard.down('Control')
                         await p.keyboard.press('Enter')
                         await p.keyboard.up('Control')
-                        await asyncio.sleep(2) 
-                    except Exception as e:
-                        logger.warning(f"KEEP-ALIVE failed for Tab #{idx+1}: {e}")
+                        await asyncio.sleep(2)
+                    except Exception:
+                        pass  # Silent fail for keep-alive
 
 @app.on_event("startup")
 async def start():
@@ -484,8 +402,6 @@ async def add_task(request: Request):
     except: pass
     mgr.tasks.append({"url": url, "page": pg, "running": True})
     
-    # Save session immediately when adding a tab
-    logger.info(">>> Auto-sync after adding tab")
     await mgr.sync_state()
     return {"success": True}
 
@@ -502,8 +418,6 @@ async def remove(idx: int):
         try: await t["page"].close()
         except: pass
         
-        # Save session immediately when removing a tab (size will decrease)
-        logger.info(">>> Auto-sync after removing tab")
         await mgr.sync_state()
     return {"success": True}
 
@@ -520,7 +434,6 @@ async def ss(idx: int):
 
 @app.post("/relaunch")
 async def relaunch():
-    logger.info(">>> Manual relaunch requested")
     asyncio.create_task(mgr.launch())
     return {"success": True}
 
