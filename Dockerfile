@@ -49,6 +49,7 @@ RUN cat > templates/index.html << 'EOF'
         .btn-p { background: var(--primary); }
         .btn-d { background: #ef4444; }
         .btn-s { background: #334155; }
+        .btn-c { background: #f59e0b; }
         .task-list { display: flex; flex-direction: column; gap: 8px; }
         .task-item { background: #1e293b; padding: 12px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; }
         .task-url { font-size: 12px; color: #94a3b8; max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -60,6 +61,8 @@ RUN cat > templates/index.html << 'EOF'
         .stat-val { font-size: 18px; font-weight: bold; display: block; }
         .stat-lbl { font-size: 10px; color: #64748b; text-transform: uppercase; }
         .preview-img { width: 100%; border-radius: 6px; border: 1px solid #334155; margin-top: 10px; }
+        .cookie-input { margin-top: 10px; }
+        .cookie-input textarea { width: 100%; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; padding: 10px; font-family: monospace; font-size: 11px; resize: vertical; min-height: 80px; }
     </style>
 </head>
 <body>
@@ -95,12 +98,22 @@ RUN cat > templates/index.html << 'EOF'
                         <div class="stat-item"><span id="sessSize" class="stat-val">0</span><span class="stat-lbl">SESS (KB)</span></div>
                     </div>
                     <div style="margin-top:15px; display:grid; gap:8px">
+                        <button class="btn btn-c" onclick="loadCookies()"><i class="fas fa-cookie-bite"></i> Load Fresh Cookies</button>
                         <button class="btn btn-s" onclick="relaunch()"><i class="fas fa-power-off"></i> Force Relaunch</button>
                     </div>
                 </div>
                 <div class="card">
                     <h3><i class="fas fa-terminal"></i> Activity</h3>
                     <div id="logs" class="log-box"></div>
+                </div>
+                <div class="card">
+                    <h3><i class="fas fa-cookie"></i> Load Custom Cookies</h3>
+                    <div class="cookie-input">
+                        <textarea id="cookieText" placeholder="Paste Netscape format cookies here..."></textarea>
+                        <button class="btn btn-p" onclick="loadCustomCookies()" style="margin-top:8px; width:100%">
+                            <i class="fas fa-upload"></i> Load Cookies
+                        </button>
+                    </div>
                 </div>
             </aside>
         </div>
@@ -165,6 +178,49 @@ RUN cat > templates/index.html << 'EOF'
             if(d.success) {
                 document.getElementById('ssCard').style.display = 'block';
                 document.getElementById('preview').src = `/screenshots/${d.file}?t=${Date.now()}`;
+            }
+        }
+
+        async function loadCookies() {
+            try {
+                const response = await fetch('/load-cookies', {method:'POST'});
+                const result = await response.json();
+                if(result.success) {
+                    log(`✅ ${result.message}`);
+                    // Relaunch browser to apply cookies
+                    await relaunch();
+                } else {
+                    log(`❌ ${result.message}`, true);
+                }
+            } catch(e) {
+                log(`❌ Cookie load failed: ${e}`, true);
+            }
+        }
+
+        async function loadCustomCookies() {
+            const cookieText = document.getElementById('cookieText').value;
+            if(!cookieText.trim()) {
+                log('❌ Please paste cookies first', true);
+                return;
+            }
+            
+            try {
+                const response = await fetch('/load-custom-cookies', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({cookies: cookieText})
+                });
+                const result = await response.json();
+                if(result.success) {
+                    log(`✅ ${result.message}`);
+                    document.getElementById('cookieText').value = '';
+                    // Relaunch browser to apply cookies
+                    await relaunch();
+                } else {
+                    log(`❌ ${result.message}`, true);
+                }
+            } catch(e) {
+                log(`❌ Cookie load failed: ${e}`, true);
             }
         }
 
@@ -235,13 +291,40 @@ class SessionManager:
             
             # If we're redirected to login page or see login forms
             if "signin" in page_url.lower() or "Sign in" in page_text or "sign in" in page_text.lower():
-                logger.warning("⚠️ GOOGLE LOGGED OUT - Need manual login")
+                logger.warning("⚠️ GOOGLE LOGGED OUT")
                 return False
             else:
                 logger.info("✅ Google logged in")
                 return True
         except Exception as e:
             logger.warning(f"⚠️ Login check failed: {e}")
+            return False
+
+    async def apply_cookies_to_all_tabs(self):
+        """Apply current cookies to all open tabs"""
+        if not self.context:
+            return False
+        
+        try:
+            cookies = await self.context.cookies()
+            logger.info(f"Applying {len(cookies)} cookies to all tabs")
+            
+            for idx, task in enumerate(self.tasks):
+                if task.get("page") and not task["page"].is_closed():
+                    try:
+                        # Clear existing cookies and add fresh ones
+                        await task["page"].context().clear_cookies()
+                        await task["page"].context().add_cookies(cookies)
+                        
+                        # Reload page with new cookies
+                        await task["page"].reload(wait_until="domcontentloaded")
+                        logger.info(f"✅ Applied cookies to Tab #{idx+1}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Tab #{idx+1} cookie apply failed: {e}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"❌ Cookie apply failed: {e}")
             return False
 
     async def launch(self):
@@ -272,17 +355,21 @@ class SessionManager:
             
             if self.storage_state:
                 logger.info(">>> RESTORING SAVED SESSION...")
-                try:
-                    self.context = await self.browser.new_context(
-                        storage_state=self.storage_state,
-                        viewport={'width': 1280, 'height': 720}
-                    )
-                except Exception as e:
-                    logger.error(f"❌ Failed to restore state: {e}")
-                    self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
+                self.context = await self.browser.new_context(
+                    storage_state=self.storage_state,
+                    viewport={'width': 1280, 'height': 720}
+                )
             else:
-                logger.info(">>> NO SAVED STATE")
+                logger.info(">>> LOADING SEED COOKIES")
                 self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
+                try:
+                    r = requests.get(self.cookie_url, timeout=10)
+                    if r.status_code == 200:
+                        cookies = self.parse_netscape(r.text)
+                        await self.context.add_cookies(cookies)
+                        logger.info(f">>> Loaded {len(cookies)} seed cookies")
+                except Exception as e:
+                    logger.warning(f"⚠️ Cookie load failed: {e}")
 
             # Check Google login status
             check_page = await self.context.new_page()
@@ -436,6 +523,61 @@ async def ss(idx: int):
 async def relaunch():
     asyncio.create_task(mgr.launch())
     return {"success": True}
+
+@app.post("/load-cookies")
+async def load_cookies():
+    """Load fresh cookies from the predefined URL"""
+    if not mgr.context:
+        return {"success": False, "message": "Browser not ready"}
+    
+    try:
+        r = requests.get(mgr.cookie_url, timeout=10)
+        if r.status_code == 200:
+            cookies = mgr.parse_netscape(r.text)
+            # Clear existing cookies and add fresh ones
+            await mgr.context.clear_cookies()
+            await mgr.context.add_cookies(cookies)
+            
+            # Apply cookies to all tabs
+            await mgr.apply_cookies_to_all_tabs()
+            
+            logger.info(f"✅ Loaded {len(cookies)} fresh cookies")
+            return {"success": True, "message": f"Loaded {len(cookies)} fresh cookies"}
+        else:
+            return {"success": False, "message": f"Failed to fetch cookies: HTTP {r.status_code}"}
+    except Exception as e:
+        logger.error(f"❌ Cookie load failed: {e}")
+        return {"success": False, "message": f"Cookie load failed: {str(e)}"}
+
+@app.post("/load-custom-cookies")
+async def load_custom_cookies(request: Request):
+    """Load custom cookies from user input"""
+    if not mgr.context:
+        return {"success": False, "message": "Browser not ready"}
+    
+    data = await request.json()
+    cookie_text = data.get("cookies", "")
+    
+    if not cookie_text:
+        return {"success": False, "message": "No cookies provided"}
+    
+    try:
+        cookies = mgr.parse_netscape(cookie_text)
+        if not cookies:
+            return {"success": False, "message": "No valid cookies found in text"}
+        
+        # Clear existing cookies and add fresh ones
+        await mgr.context.clear_cookies()
+        await mgr.context.add_cookies(cookies)
+        
+        # Apply cookies to all tabs
+        await mgr.apply_cookies_to_all_tabs()
+        
+        logger.info(f"✅ Loaded {len(cookies)} custom cookies")
+        return {"success": True, "message": f"Loaded {len(cookies)} custom cookies"}
+    except Exception as e:
+        logger.error(f"❌ Custom cookie load failed: {e}")
+        return {"success": False, "message": f"Cookie load failed: {str(e)}"}
 
 if __name__ == "__main__":
     import uvicorn
