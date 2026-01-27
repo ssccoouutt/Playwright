@@ -15,13 +15,13 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Install Python packages
-RUN pip install playwright==1.40.0 fastapi==0.104.1 uvicorn==0.24.0 python-multipart jinja2 requests psutil google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+RUN pip install playwright==1.40.0 fastapi==0.104.1 uvicorn==0.24.0 python-multipart jinja2 requests psutil
 
 # Install Chromium
 RUN playwright install chromium
 
 # Create directories
-RUN mkdir -p templates
+RUN mkdir -p templates screenshots
 
 # --- DASHBOARD UI ---
 RUN cat > templates/index.html << 'EOF'
@@ -63,13 +63,13 @@ RUN cat > templates/index.html << 'EOF'
         .preview-img { width: 100%; border-radius: 6px; border: 1px solid #334155; margin-top: 10px; }
         .cookie-input { margin-top: 10px; }
         .cookie-input textarea { width: 100%; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; padding: 10px; font-family: monospace; font-size: 11px; resize: vertical; min-height: 80px; }
-        .drive-badge { font-size: 10px; background: #1e40af; color: #93c5fd; padding: 2px 6px; border-radius: 10px; margin-left: 5px; }
+        .permanent-tag { font-size: 9px; background: #1e40af; color: #93c5fd; padding: 2px 6px; border-radius: 10px; margin-left: 5px; }
     </style>
 </head>
 <body>
     <div class="container">
         <header class="header">
-            <h1><i class="fas fa-shield-halved"></i> Colab Guard Pro <span class="drive-badge">Google Drive</span></h1>
+            <h1><i class="fas fa-shield-halved"></i> Colab Guard Pro</h1>
             <div id="bStatus" class="status-badge dead">Connecting...</div>
         </header>
 
@@ -83,7 +83,7 @@ RUN cat > templates/index.html << 'EOF'
                     </div>
                 </div>
                 <div class="card">
-                    <h3><i class="fas fa-microchip"></i> Active Tabs</h3>
+                    <h3><i class="fas fa-microchip"></i> Active Tabs <span style="font-size:11px; color:#94a3b8">(Google.com is permanent first tab)</span></h3>
                     <div id="taskList" class="task-list" style="margin-top:12px"></div>
                 </div>
                 <div id="ssCard" class="card" style="display:none">
@@ -96,7 +96,7 @@ RUN cat > templates/index.html << 'EOF'
                     <h3><i class="fas fa-chart-line"></i> Performance</h3>
                     <div class="stats">
                         <div class="stat-item"><span id="mem" class="stat-val">0</span><span class="stat-lbl">RAM (MB)</span></div>
-                        <div class="stat-item"><span id="driveState" class="stat-val">❓</span><span class="stat-lbl">DRIVE STATE</span></div>
+                        <div class="stat-item"><span id="sessSize" class="stat-val">0</span><span class="stat-lbl">SESS (KB)</span></div>
                     </div>
                     <div style="margin-top:15px; display:grid; gap:8px">
                         <button class="btn btn-c" onclick="loadCookies()"><i class="fas fa-cookie-bite"></i> Load Fresh Cookies</button>
@@ -138,22 +138,35 @@ RUN cat > templates/index.html << 'EOF'
                 bs.className = `status-badge ${d.alive ? 'alive' : 'dead'}`;
                 bs.textContent = d.alive ? 'BROWSER ONLINE' : 'ENGINE RESTARTING';
                 document.getElementById('mem').textContent = d.memory;
-                document.getElementById('driveState').textContent = d.drive_state;
+                document.getElementById('sessSize').textContent = d.session_size_kb;
 
                 const list = document.getElementById('taskList');
                 list.innerHTML = '';
                 d.tasks.forEach((t, i) => {
                     const item = document.createElement('div');
                     item.className = 'task-item';
+                    const isPermanent = t.url.includes('google.com') && i === 0;
                     item.innerHTML = `
                         <div style="flex:1">
-                            <div style="font-size:11px; color:${t.running?'#4ade80':'#94a3b8'}">${t.running?'● RUNNING':'● STOPPED'}</div>
+                            <div style="display:flex; align-items:center">
+                                <div style="font-size:11px; color:${t.running?'#4ade80':'#94a3b8'}">
+                                    ${t.running?'● RUNNING':'● STOPPED'}
+                                </div>
+                                ${isPermanent ? '<span class="permanent-tag">PERMANENT</span>' : ''}
+                            </div>
                             <div class="task-url">${t.url}</div>
                         </div>
                         <div style="display:flex; gap:5px">
                             <button class="btn btn-s" onclick="view(${i})"><i class="fas fa-eye"></i></button>
-                            <button class="btn ${t.running?'btn-d':'btn-p'}" onclick="toggle(${i})"><i class="fas fa-${t.running?'stop':'play'}"></i></button>
-                            <button class="btn btn-s" onclick="remove(${i})"><i class="fas fa-trash"></i></button>
+                            ${!isPermanent ? `
+                                <button class="btn ${t.running?'btn-d':'btn-p'}" onclick="toggle(${i})">
+                                    <i class="fas fa-${t.running?'stop':'play'}"></i>
+                                </button>
+                                <button class="btn btn-s" onclick="remove(${i})"><i class="fas fa-trash"></i></button>
+                            ` : `
+                                <button class="btn btn-s" disabled><i class="fas fa-lock"></i></button>
+                                <button class="btn btn-s" disabled><i class="fas fa-lock"></i></button>
+                            `}
                         </div>
                     `;
                     list.appendChild(item);
@@ -169,8 +182,20 @@ RUN cat > templates/index.html << 'EOF'
             refresh();
         }
 
-        async function toggle(i) { await fetch(`/tasks/${i}/toggle`, {method:'POST'}); refresh(); }
-        async function remove(i) { await fetch(`/tasks/${i}`, {method:'DELETE'}); refresh(); }
+        async function toggle(i) { 
+            // Don't allow toggling permanent google.com tab (index 0)
+            if(i === 0) return;
+            await fetch(`/tasks/${i}/toggle`, {method:'POST'}); 
+            refresh(); 
+        }
+
+        async function remove(i) { 
+            // Don't allow removing permanent google.com tab (index 0)
+            if(i === 0) return;
+            await fetch(`/tasks/${i}`, {method:'DELETE'}); 
+            refresh(); 
+        }
+
         async function relaunch() { await fetch('/relaunch', {method:'POST'}); }
 
         async function view(i) {
@@ -178,7 +203,7 @@ RUN cat > templates/index.html << 'EOF'
             const d = await r.json();
             if(d.success) {
                 document.getElementById('ssCard').style.display = 'block';
-                document.getElementById('preview').src = `/screenshot/${i}?t=${Date.now()}`;
+                document.getElementById('preview').src = `/screenshots/${d.file}?t=${Date.now()}`;
             }
         }
 
@@ -208,7 +233,7 @@ RUN cat > templates/index.html << 'EOF'
             try {
                 const response = await fetch('/load-custom-cookies', {
                     method: 'POST',
-                    headers: {'Content-Type':'application/json'},
+                    headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({cookies: cookieText})
                 });
                 const result = await response.json();
@@ -241,16 +266,12 @@ import logging
 import requests
 import json
 import time
-import io
-import base64
-from datetime import datetime, timedelta
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+import sys
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from playwright.async_api import async_playwright
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
 # Minimal Logging - Only important info
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -258,174 +279,11 @@ logger = logging.getLogger("Bot")
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
-
-# Hardcoded Google Drive credentials
-DRIVE_CREDENTIALS = {
-    "token": "ya29.a0AS3H6NzvntITO1LFz3T3we5n9mQGiY6KqA2TKzpWhppuUalPdG-shWjvTljC_TbYcWigReEc_T38nDHrn11Rscr6PPRzY1YR59zZQQztj4crL7d9cuc4X2OC0Hz5Q-1OIqSJcH6GSERBZEhUIMgh6sOBYr1jzdhj4w6Gu6hfaCgYKAfESARQSFQHGX2Mijb2Oudks2xwUOQ-DQ3hqzw0175",
-    "refresh_token": "1//03P2kdvxV8pieCgYIARAAGAMSNwF-L9Irg_RYyNkqsFYHnKNYhhw-wQXaJzbLiT8cn_JMn7gToeRiivW8uwdab3475J8dNB8Mq6k",
-    "token_uri": "https://oauth2.googleapis.com/token",
-    "client_id": "704057951722-2llchdubr050n3v0shmf2omslhv6t8v7.apps.googleusercontent.com",
-    "client_secret": "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",
-    "scopes": ["https://www.googleapis.com/auth/drive"],
-    "universe_domain": "googleapis.com",
-    "account": "",
-    "expiry": "2025-07-09T08:28:54.969314Z"
-}
-
-# Drive file IDs
-STATE_FILE_ID = "1NZ3NvyVBnK85S8f5eTZJS5uM5c59xvGM"  # Your token file ID - will use for state
-COOKIE_FILE_ID = "1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm"  # Your cookie file ID
-SCREENSHOT_FOLDER_ID = None  # Will create if doesn't exist
-
-class GoogleDriveManager:
-    def __init__(self):
-        self.creds = None
-        self.service = None
-        self.screenshot_folder_id = None
-        self.initialize()
-    
-    def initialize(self):
-        """Initialize Google Drive API with hardcoded credentials."""
-        try:
-            # Create credentials from hardcoded token
-            self.creds = Credentials.from_authorized_user_info(DRIVE_CREDENTIALS)
-            
-            # Check if token is expired or about to expire
-            expiry_time = datetime.fromisoformat(DRIVE_CREDENTIALS["expiry"].replace('Z', '+00:00'))
-            if datetime.utcnow() + timedelta(minutes=5) > expiry_time:
-                logger.warning("⚠️ Drive token expired/expiring soon - may need refresh")
-            
-            # Build service
-            self.service = build('drive', 'v3', credentials=self.creds)
-            
-            # Find or create screenshot folder
-            self.find_or_create_screenshot_folder()
-            
-            logger.info("✅ Google Drive initialized")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Drive initialization failed: {e}")
-            return False
-    
-    def find_or_create_screenshot_folder(self):
-        """Find or create 'ColabGuard_Screenshots' folder."""
-        try:
-            # Search for existing folder
-            response = self.service.files().list(
-                q="name='ColabGuard_Screenshots' and mimeType='application/vnd.google-apps.folder' and trashed=false",
-                spaces='drive',
-                fields='files(id, name)'
-            ).execute()
-            
-            if response['files']:
-                self.screenshot_folder_id = response['files'][0]['id']
-                logger.info(f"✅ Found screenshot folder: {self.screenshot_folder_id}")
-            else:
-                # Create new folder
-                folder_metadata = {
-                    'name': 'ColabGuard_Screenshots',
-                    'mimeType': 'application/vnd.google-apps.folder'
-                }
-                folder = self.service.files().create(body=folder_metadata, fields='id').execute()
-                self.screenshot_folder_id = folder['id']
-                logger.info(f"✅ Created screenshot folder: {self.screenshot_folder_id}")
-                
-        except Exception as e:
-            logger.error(f"❌ Screenshot folder setup failed: {e}")
-    
-    async def save_state_to_drive(self, state_data):
-        """Save browser state to Google Drive."""
-        try:
-            state_json = json.dumps(state_data, indent=2)
-            
-            # Create in-memory file
-            state_bytes = state_json.encode('utf-8')
-            state_io = io.BytesIO(state_bytes)
-            
-            # Update existing file
-            media = MediaIoBaseUpload(state_io, mimetype='application/json')
-            file_metadata = {'name': 'colab_guard_state.json'}
-            
-            self.service.files().update(
-                fileId=STATE_FILE_ID,
-                body=file_metadata,
-                media_body=media
-            ).execute()
-            
-            size_kb = len(state_json) // 1024
-            logger.info(f"✅ State saved to Drive: {size_kb} KB")
-            return size_kb
-            
-        except Exception as e:
-            logger.error(f"❌ Drive save failed: {e}")
-            return 0
-    
-    async def load_state_from_drive(self):
-        """Load browser state from Google Drive."""
-        try:
-            # Download file
-            request = self.service.files().get_media(fileId=STATE_FILE_ID)
-            state_io = io.BytesIO()
-            downloader = MediaIoBaseDownload(state_io, request)
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
-            
-            state_json = state_io.getvalue().decode('utf-8')
-            state_data = json.loads(state_json)
-            
-            size_kb = len(state_json) // 1024
-            cookie_count = len(state_data.get('cookies', []))
-            logger.info(f"✅ State loaded from Drive: {size_kb} KB ({cookie_count} cookies)")
-            return state_data
-            
-        except Exception as e:
-            logger.error(f"❌ Drive load failed: {e}")
-            return None
-    
-    async def save_screenshot_to_drive(self, screenshot_bytes, filename):
-        """Save screenshot to Google Drive."""
-        try:
-            if not self.screenshot_folder_id:
-                logger.error("❌ No screenshot folder configured")
-                return None
-            
-            # Create in-memory file
-            screenshot_io = io.BytesIO(screenshot_bytes)
-            
-            # Upload to Drive
-            media = MediaIoBaseUpload(screenshot_io, mimetype='image/png')
-            file_metadata = {
-                'name': filename,
-                'parents': [self.screenshot_folder_id]
-            }
-            
-            file = self.service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id, webViewLink'
-            ).execute()
-            
-            logger.info(f"✅ Screenshot saved to Drive: {filename}")
-            return file.get('id')
-            
-        except Exception as e:
-            logger.error(f"❌ Screenshot save failed: {e}")
-            return None
-    
-    def get_drive_status(self):
-        """Get Google Drive connection status."""
-        if not self.service:
-            return "❌ NOT CONNECTED"
-        try:
-            # Simple test query
-            self.service.files().list(pageSize=1, fields="files(id)").execute()
-            return "✅ CONNECTED"
-        except Exception as e:
-            return f"⚠️ ERROR: {str(e)[:30]}"
+os.makedirs("screenshots", exist_ok=True)
+app.mount("/screenshots", StaticFiles(directory="screenshots"), name="screenshots")
 
 class SessionManager:
-    def __init__(self, drive_manager):
+    def __init__(self):
         self.pw = None
         self.browser = None
         self.context = None
@@ -433,9 +291,17 @@ class SessionManager:
         self.lock = asyncio.Lock()
         self.is_busy = False
         self.storage_state = None 
-        self.drive = drive_manager
-        self.cookie_file_id = COOKIE_FILE_ID
-    
+        self.cookie_url = "https://drive.usercontent.google.com/download?id=1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm&export=download"
+        
+        # Add permanent Google.com tab as first task
+        self.permanent_google_tab = {
+            "url": "https://www.google.com",
+            "page": None,
+            "running": True,
+            "permanent": True  # Mark as permanent
+        }
+        self.tasks.append(self.permanent_google_tab)
+
     def parse_netscape(self, text):
         cookies = []
         for line in text.splitlines():
@@ -449,14 +315,16 @@ class SessionManager:
         return cookies
     
     async def check_google_login(self, page):
-        """Check if Google account is logged in."""
+        """Check if Google account is logged in by visiting accounts.google.com"""
         try:
             await page.goto("https://accounts.google.com", wait_until="domcontentloaded", timeout=10000)
             await asyncio.sleep(2)
             
+            # Check for login page indicators
             page_text = await page.content()
             page_url = page.url
             
+            # If we're redirected to login page or see login forms
             if "signin" in page_url.lower() or "Sign in" in page_text or "sign in" in page_text.lower():
                 logger.warning("⚠️ GOOGLE LOGGED OUT")
                 return False
@@ -467,15 +335,42 @@ class SessionManager:
             logger.warning(f"⚠️ Login check failed: {e}")
             return False
 
+    async def apply_cookies_to_all_tabs(self):
+        """Apply current cookies to all open tabs"""
+        if not self.context:
+            return False
+        
+        try:
+            cookies = await self.context.cookies()
+            logger.info(f"Applying {len(cookies)} cookies to all tabs")
+            
+            for idx, task in enumerate(self.tasks):
+                if task.get("page") and not task["page"].is_closed():
+                    try:
+                        # Clear existing cookies and add fresh ones
+                        await task["page"].context().clear_cookies()
+                        await task["page"].context().add_cookies(cookies)
+                        
+                        # Reload page with new cookies
+                        await task["page"].reload(wait_until="domcontentloaded")
+                        logger.info(f"✅ Applied cookies to Tab #{idx+1}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Tab #{idx+1} cookie apply failed: {e}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"❌ Cookie apply failed: {e}")
+            return False
+
     async def launch(self):
-        """Restores browser engine with saved state from Google Drive."""
+        """Restores browser engine with saved state to prevent logout."""
         if self.is_busy: return
         self.is_busy = True
         
         try:
             logger.info(">>> ENGINE: INITIATING RE-LAUNCH")
             
-            # Save state before closing (if we have a context)
+            # ALWAYS sync state before closing
             if self.context:
                 await self.sync_state()
 
@@ -493,46 +388,62 @@ class SessionManager:
                 ]
             )
             
-            # Try to load state from Google Drive
-            loaded_state = await self.drive.load_state_from_drive()
-            if loaded_state:
-                logger.info(">>> RESTORING STATE FROM DRIVE...")
-                try:
-                    self.context = await self.browser.new_context(
-                        storage_state=loaded_state,
-                        viewport={'width': 1280, 'height': 720}
-                    )
-                    self.storage_state = loaded_state
-                    logger.info(">>> STATE RESTORED SUCCESSFULLY")
-                except Exception as e:
-                    logger.error(f">>> Failed to restore state: {e}")
-                    self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
+            if self.storage_state:
+                logger.info(">>> RESTORING SAVED SESSION...")
+                self.context = await self.browser.new_context(
+                    storage_state=self.storage_state,
+                    viewport={'width': 1280, 'height': 720}
+                )
             else:
-                # Fresh launch with seed cookies
-                logger.info(">>> FRESH LAUNCH - LOADING SEED COOKIES")
+                logger.info(">>> LOADING SEED COOKIES")
                 self.context = await self.browser.new_context(viewport={'width': 1280, 'height': 720})
-                await self.load_seed_cookies()
+                try:
+                    r = requests.get(self.cookie_url, timeout=10)
+                    if r.status_code == 200:
+                        cookies = self.parse_netscape(r.text)
+                        await self.context.add_cookies(cookies)
+                        logger.info(f">>> Loaded {len(cookies)} seed cookies")
+                except Exception as e:
+                    logger.warning(f"⚠️ Cookie load failed: {e}")
 
-            # Check login status
-            check_page = await self.context.new_page()
-            is_logged_in = await self.check_google_login(check_page)
-            await check_page.close()
-            
-            if not is_logged_in:
-                logger.warning("⚠️ ACCOUNT LOGGED OUT - Opening login page")
-                login_page = await self.context.new_page()
-                await login_page.goto("https://accounts.google.com", wait_until="domcontentloaded")
-                logger.info("⚠️ Please login manually at: https://accounts.google.com")
+            # Check Google login status using the permanent Google tab
+            if self.tasks[0].get("page"):
+                try:
+                    await self.tasks[0]["page"].goto("https://accounts.google.com", wait_until="domcontentloaded", timeout=10000)
+                    await asyncio.sleep(2)
+                    page_text = await self.tasks[0]["page"].content()
+                    page_url = self.tasks[0]["page"].url
+                    
+                    if "signin" in page_url.lower() or "Sign in" in page_text or "sign in" in page_text.lower():
+                        logger.warning("⚠️ GOOGLE LOGGED OUT")
+                        # Navigate back to google.com
+                        await self.tasks[0]["page"].goto("https://www.google.com", wait_until="domcontentloaded")
+                    else:
+                        logger.info("✅ Google logged in")
+                        # Navigate back to google.com
+                        await self.tasks[0]["page"].goto("https://www.google.com", wait_until="domcontentloaded")
+                except Exception as e:
+                    logger.warning(f"⚠️ Login check failed: {e}")
 
-            # Restore all tabs
+            # Restore all tabs (permanent Google tab first)
             for idx, task in enumerate(self.tasks):
                 try:
                     new_page = await self.context.new_page()
                     self.tasks[idx]["page"] = new_page
+                    
+                    # Load the URL
                     await new_page.goto(task["url"], wait_until="domcontentloaded", timeout=60000)
-                    logger.info(f">>> Tab #{idx+1} restored")
+                    
+                    if idx == 0:
+                        logger.info(f">>> Permanent Google tab restored")
+                    else:
+                        logger.info(f">>> Tab #{idx+1} restored")
+                        
                 except Exception as e:
-                    logger.warning(f">>> Tab #{idx+1} error: {e}")
+                    if idx == 0:
+                        logger.warning(f">>> Permanent Google tab error: {e}")
+                    else:
+                        logger.warning(f">>> Tab #{idx+1} error: {e}")
             
             logger.info(">>> ENGINE ONLINE")
         except Exception as e:
@@ -540,58 +451,72 @@ class SessionManager:
         finally:
             self.is_busy = False
 
-    async def load_seed_cookies(self):
-        """Load seed cookies from Google Drive."""
-        try:
-            # Download cookie file from Drive
-            request = self.drive.service.files().get_media(fileId=self.cookie_file_id)
-            cookie_io = io.BytesIO()
-            downloader = MediaIoBaseDownload(cookie_io, request)
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
-            
-            cookie_text = cookie_io.getvalue().decode('utf-8')
-            cookies = self.parse_netscape(cookie_text)
-            
-            if cookies:
-                await self.context.add_cookies(cookies)
-                logger.info(f">>> Loaded {len(cookies)} seed cookies")
-            else:
-                logger.warning(">>> No cookies parsed from seed file")
-                
-        except Exception as e:
-            logger.error(f"!!! COOKIE LOAD FAILED: {e}")
-
     async def sync_state(self):
-        """TELEGRAM BOT STRATEGY: Save full browser state to Google Drive."""
+        """Saves current session state to memory - FROM PERMANENT GOOGLE TAB ONLY."""
         if not self.context:
             return 0
             
         try:
-            logger.info(">>> SAVING FULL STATE TO DRIVE...")
+            logger.info(">>> SAVING STATE (from Google tab)...")
             
-            # TELEGRAM BOT CORE LOGIC: Save complete storage state
+            # Use the permanent Google.com tab for sync (index 0)
+            google_tab = self.tasks[0].get("page") if len(self.tasks) > 0 else None
+            
+            if google_tab and not google_tab.is_closed():
+                try:
+                    # Bring Google tab to front for sync
+                    await google_tab.bring_to_front()
+                    await asyncio.sleep(1)  # Let page settle
+                    
+                    # Get cookies from context (shared across all tabs)
+                    cookies = await self.context.cookies()
+                    
+                    # Get localStorage from Google tab
+                    origins = []
+                    try:
+                        local_storage = await google_tab.evaluate("""() => {
+                            const items = {};
+                            for (let i = 0; i < localStorage.length; i++) {
+                                const key = localStorage.key(i);
+                                items[key] = localStorage.getItem(key);
+                            }
+                            return items;
+                        }""")
+                        
+                        if local_storage:
+                            origins.append({
+                                "origin": google_tab.url,
+                                "localStorage": [{"name": k, "value": v} for k, v in local_storage.items()]
+                            })
+                    except:
+                        pass
+                    
+                    # Create minimal storage state
+                    self.storage_state = {
+                        "cookies": cookies,
+                        "origins": origins
+                    }
+                    
+                    size_kb = len(json.dumps(self.storage_state)) // 1024
+                    logger.info(f">>> STATE SAVED: {size_kb} KB (from Google tab)")
+                    return size_kb
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ Google tab save failed: {e}")
+            
+            # Fallback to context storage
+            logger.info(">>> Falling back to context storage...")
             self.storage_state = await self.context.storage_state()
+            size_kb = len(json.dumps(self.storage_state)) // 1024
+            logger.info(f">>> STATE SAVED: {size_kb} KB (fallback)")
+            return size_kb
             
-            # Save to Google Drive
-            size_kb = await self.drive.save_state_to_drive(self.storage_state)
-            
-            if size_kb > 0:
-                cookie_count = len(self.storage_state.get('cookies', [])) if self.storage_state else 0
-                logger.info(f">>> STATE SAVED: {size_kb} KB ({cookie_count} cookies)")
-                return size_kb
-            else:
-                logger.error("❌ Drive save returned 0")
-                return 0
-                
         except Exception as e:
             logger.error(f"❌ STATE SAVE FAILED: {e}")
+            # Keep old state if save fails
             return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
 
-# Initialize managers
-drive_manager = GoogleDriveManager()
-mgr = SessionManager(drive_manager)
+mgr = SessionManager()
 
 async def watchdog():
     """Relaunches browser every 15 minutes."""
@@ -608,7 +533,11 @@ async def automation():
         await asyncio.sleep(300)
         if mgr.is_busy or not mgr.context: continue
         
+        # Skip the permanent Google tab (index 0) for Ctrl+Enter automation
         for idx, task in enumerate(mgr.tasks):
+            if idx == 0:  # Skip permanent Google tab
+                continue
+                
             if task["running"] and task.get("page"):
                 async with mgr.lock:
                     try:
@@ -641,14 +570,11 @@ async def get_status():
     for c in proc.children(recursive=True):
         try: mem += c.memory_info().rss / (1024*1024)
         except: pass
-    
     size_kb = len(json.dumps(mgr.storage_state)) // 1024 if mgr.storage_state else 0
-    drive_status = drive_manager.get_drive_status()
-    
     return {
         "alive": mgr.browser.is_connected() if mgr.browser else False,
         "memory": int(mem),
-        "drive_state": drive_status,
+        "session_size_kb": size_kb,
         "tasks": [{"url": t["url"], "running": t["running"]} for t in mgr.tasks]
     }
 
@@ -660,19 +586,29 @@ async def add_task(request: Request):
     pg = await mgr.context.new_page()
     try: await pg.goto(url, wait_until="domcontentloaded", timeout=60000)
     except: pass
-    mgr.tasks.append({"url": url, "page": pg, "running": True})
+    
+    # Add after permanent Google tab (index 0)
+    mgr.tasks.insert(1, {"url": url, "page": pg, "running": True})
     
     await mgr.sync_state()
     return {"success": True}
 
 @app.post("/tasks/{idx}/toggle")
 async def toggle(idx: int):
+    # Don't allow toggling permanent Google tab (index 0)
+    if idx == 0:
+        return {"success": False, "message": "Cannot toggle permanent Google tab"}
+    
     if 0 <= idx < len(mgr.tasks):
         mgr.tasks[idx]["running"] = not mgr.tasks[idx]["running"]
     return {"success": True}
 
 @app.delete("/tasks/{idx}")
 async def remove(idx: int):
+    # Don't allow removing permanent Google tab (index 0)
+    if idx == 0:
+        return {"success": False, "message": "Cannot remove permanent Google tab"}
+    
     if 0 <= idx < len(mgr.tasks):
         t = mgr.tasks.pop(idx)
         try: await t["page"].close()
@@ -681,70 +617,50 @@ async def remove(idx: int):
         await mgr.sync_state()
     return {"success": True}
 
-@app.get("/screenshot/{idx}")
-async def get_screenshot(idx: int):
+@app.get("/tasks/{idx}/screenshot")
+async def ss(idx: int):
     if 0 <= idx < len(mgr.tasks):
+        name = f"ss_{idx}.png"
+        path = f"screenshots/{name}"
         try:
-            screenshot = await mgr.tasks[idx]["page"].screenshot()
-            
-            # Save to Drive
-            filename = f"screenshot_{idx}_{int(time.time())}.png"
-            file_id = await drive_manager.save_screenshot_to_drive(screenshot, filename)
-            
-            if file_id:
-                # Return the screenshot directly
-                return StreamingResponse(
-                    io.BytesIO(screenshot),
-                    media_type="image/png",
-                    headers={"Content-Disposition": f"inline; filename={filename}"}
-                )
-        except:
-            pass
-    raise HTTPException(status_code=404, detail="Screenshot failed")
+            await mgr.tasks[idx]["page"].screenshot(path=path)
+            return {"success": True, "file": name}
+        except: pass
+    return {"success": False}
+
+@app.post("/relaunch")
+async def relaunch():
+    asyncio.create_task(mgr.launch())
+    return {"success": True}
 
 @app.post("/load-cookies")
 async def load_cookies():
-    """Load fresh cookies from Google Drive."""
+    """Load fresh cookies from the predefined URL"""
     if not mgr.context:
         return {"success": False, "message": "Browser not ready"}
     
     try:
-        # Download fresh cookies
-        request = drive_manager.service.files().get_media(fileId=mgr.cookie_file_id)
-        cookie_io = io.BytesIO()
-        downloader = MediaIoBaseDownload(cookie_io, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-        
-        cookie_text = cookie_io.getvalue().decode('utf-8')
-        cookies = mgr.parse_netscape(cookie_text)
-        
-        if cookies:
+        r = requests.get(mgr.cookie_url, timeout=10)
+        if r.status_code == 200:
+            cookies = mgr.parse_netscape(r.text)
             # Clear existing cookies and add fresh ones
             await mgr.context.clear_cookies()
             await mgr.context.add_cookies(cookies)
             
-            # Apply to all tabs
-            for task in mgr.tasks:
-                if task.get("page") and not task["page"].is_closed():
-                    try:
-                        await task["page"].reload(wait_until="domcontentloaded")
-                    except:
-                        pass
+            # Apply cookies to all tabs
+            await mgr.apply_cookies_to_all_tabs()
             
             logger.info(f"✅ Loaded {len(cookies)} fresh cookies")
             return {"success": True, "message": f"Loaded {len(cookies)} fresh cookies"}
         else:
-            return {"success": False, "message": "No valid cookies found"}
-            
+            return {"success": False, "message": f"Failed to fetch cookies: HTTP {r.status_code}"}
     except Exception as e:
         logger.error(f"❌ Cookie load failed: {e}")
         return {"success": False, "message": f"Cookie load failed: {str(e)}"}
 
 @app.post("/load-custom-cookies")
 async def load_custom_cookies(request: Request):
-    """Load custom cookies from user input."""
+    """Load custom cookies from user input"""
     if not mgr.context:
         return {"success": False, "message": "Browser not ready"}
     
@@ -763,24 +679,14 @@ async def load_custom_cookies(request: Request):
         await mgr.context.clear_cookies()
         await mgr.context.add_cookies(cookies)
         
-        # Apply to all tabs
-        for task in mgr.tasks:
-            if task.get("page") and not task["page"].is_closed():
-                try:
-                    await task["page"].reload(wait_until="domcontentloaded")
-                except:
-                    pass
+        # Apply cookies to all tabs
+        await mgr.apply_cookies_to_all_tabs()
         
         logger.info(f"✅ Loaded {len(cookies)} custom cookies")
         return {"success": True, "message": f"Loaded {len(cookies)} custom cookies"}
     except Exception as e:
         logger.error(f"❌ Custom cookie load failed: {e}")
         return {"success": False, "message": f"Cookie load failed: {str(e)}"}
-
-@app.post("/relaunch")
-async def relaunch():
-    asyncio.create_task(mgr.launch())
-    return {"success": True}
 
 if __name__ == "__main__":
     import uvicorn
