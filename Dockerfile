@@ -407,18 +407,37 @@ class SessionManager:
         if self.context:
             try:
                 logger.info(">>> SAVING STATE...")
-                self.storage_state = await asyncio.wait_for(
-                    self.context.storage_state(),
-                    timeout=300.0  # 5 minutes for heavy sessions
-                )
+                
+                # Close any login pages before saving (they cause timeouts)
+                for page in self.context.pages:
+                    try:
+                        if "accounts.google.com" in page.url:
+                            await page.close()
+                            logger.info(">>> Closed login page before save")
+                    except:
+                        pass
+                
+                # Save state with NO TIMEOUT - let it run as long as needed
+                # Use try-except to handle Playwright's internal timeout
+                try:
+                    # First try with 5 minute timeout
+                    self.storage_state = await asyncio.wait_for(
+                        self.context.storage_state(),
+                        timeout=300.0  # 5 minutes = 300 seconds
+                    )
+                except asyncio.TimeoutError:
+                    # If 5 minutes not enough, try without timeout
+                    logger.warning(">>> 5 min timeout, trying without limit...")
+                    self.storage_state = await self.context.storage_state()
+                
                 size_kb = len(json.dumps(self.storage_state)) // 1024
                 logger.info(f">>> STATE SAVED: {size_kb} KB")
                 return size_kb
-            except asyncio.TimeoutError:
-                logger.error("❌ STATE SAVE TIMEOUT")
-                return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
+                
             except Exception as e:
                 logger.error(f"❌ STATE SAVE FAILED: {e}")
+                # Keep old state if save fails
+                return len(json.dumps(self.storage_state)) // 1024 if self.storage_state else 0
         return 0
 
 mgr = SessionManager()
