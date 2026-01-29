@@ -275,7 +275,7 @@ from playwright.async_api import async_playwright
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 
 # Setup Pakistan timezone
@@ -288,9 +288,10 @@ def pkt_now():
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger()
 
-# Disable verbose Playwright logs
+# Disable verbose logs
 logging.getLogger('playwright').setLevel(logging.WARNING)
 logging.getLogger('googleapiclient').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
@@ -358,7 +359,7 @@ class GoogleDriveManager:
                     'parents': [self.folder_id]
                 }
                 
-                media = MediaFileUpload(file_path, resumable=True)
+                media = MediaFileUpload(file_path, resumable=False)  # Changed to non-resumable
                 file = self.service.files().create(
                     body=file_metadata,
                     media_body=media,
@@ -371,7 +372,7 @@ class GoogleDriveManager:
             except Exception as e:
                 if attempt < max_retries - 1:
                     logger.warning(f"[DRIVE] Retry {attempt+1}/{max_retries}: {str(e)[:50]}")
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                    time.sleep(2 ** attempt)
                 else:
                     logger.error(f"[DRIVE] ✗ {file_name}: {str(e)[:50]}")
         
@@ -399,6 +400,7 @@ class SessionManager:
         self.is_busy = False
         self.last_sync_time = 0
         self.sync_attempts = 0
+        self.storage_state = None  # Initialize storage_state here
         self.cookie_url = "https://drive.usercontent.google.com/download?id=1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm&export=download"
         self.drive_mgr = GoogleDriveManager()
         
@@ -444,7 +446,7 @@ class SessionManager:
         
         # Emergency fallback: save locally
         try:
-            if hasattr(self, 'storage_state') and self.storage_state:
+            if self.storage_state:
                 with open('/tmp/emergency_state.json', 'w') as f:
                     json.dump(self.storage_state, f)
                 logger.warning("[SYNC] Emergency local save")
@@ -545,10 +547,13 @@ class SessionManager:
             self.storage_state = state_data
             
             # Cleanup
-            os.remove(local_state_path)
-            os.remove(local_tabs_path)
+            try:
+                os.remove(local_state_path)
+                os.remove(local_tabs_path)
+            except:
+                pass
             
-            return state_uploaded or not self.drive_mgr.service  # Return True if uploaded OR drive not available
+            return state_uploaded or not self.drive_mgr.service
             
         except Exception as e:
             logger.error(f"[SYNC] Save error: {str(e)[:50]}")
@@ -609,7 +614,10 @@ class SessionManager:
                 self.drive_mgr.upload_with_retry(local_path, f"Critical: {stage}")
             
             # Move to local screenshots
-            os.rename(local_path, f"screenshots/{filename}")
+            try:
+                os.rename(local_path, f"screenshots/{filename}")
+            except:
+                pass
             
         except Exception as e:
             logger.warning(f"[SS] Failed: {str(e)[:50]}")
@@ -631,12 +639,15 @@ class SessionManager:
                 await self.critical_screenshot("before_relaunch")
             
             # Step 2: Close existing browser
-            if self.context: 
-                await self.context.close()
-            if self.browser: 
-                await self.browser.close()
-            if self.pw: 
-                await self.pw.stop()
+            try:
+                if self.context: 
+                    await self.context.close()
+                if self.browser: 
+                    await self.browser.close()
+                if self.pw: 
+                    await self.pw.stop()
+            except:
+                pass
             
             # Step 3: Start new browser
             self.pw = await async_playwright().start()
@@ -654,10 +665,11 @@ class SessionManager:
             if drive_state:
                 self.storage_state = drive_state
                 logger.info("[STATE] Using Drive state")
-            elif hasattr(self, 'storage_state') and self.storage_state:
+            elif self.storage_state:
                 logger.info("[STATE] Using local state")
             else:
                 logger.info("[STATE] Starting fresh")
+                self.storage_state = None
             
             # Step 5: Create context with saved state
             if self.storage_state:
@@ -707,8 +719,11 @@ class SessionManager:
             logger.info(">>> ENGINE: ONLINE ✓")
             
         except Exception as e:
-            logger.error(f">>> ENGINE: FAILED - {str(e)[:50]}")
-            await self.critical_screenshot("launch_failure")
+            logger.error(f">>> ENGINE: FAILED - {str(e)}")
+            try:
+                await self.critical_screenshot("launch_failure")
+            except:
+                pass
         finally:
             self.is_busy = False
 
@@ -772,8 +787,8 @@ async def browser_watchdog():
 @app.on_event("startup")
 async def start():
     asyncio.create_task(mgr.launch())
-    asyncio.create_task(state_watchdog())   # Most important - runs first
-    asyncio.create_task(browser_watchdog()) # Runs after state is saved
+    asyncio.create_task(state_watchdog())
+    asyncio.create_task(browser_watchdog())
     asyncio.create_task(automation())
 
 @app.get("/", response_class=HTMLResponse)
@@ -788,7 +803,12 @@ async def get_status():
         try: mem += c.memory_info().rss / (1024*1024)
         except: pass
     
-    size_kb = len(json.dumps(mgr.storage_state)) // 1024 if hasattr(mgr, 'storage_state') and mgr.storage_state else 0
+    size_kb = 0
+    if mgr.storage_state:
+        try:
+            size_kb = len(json.dumps(mgr.storage_state)) // 1024
+        except:
+            pass
     
     return {
         "alive": mgr.browser.is_connected() if mgr.browser else False,
