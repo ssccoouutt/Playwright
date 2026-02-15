@@ -145,7 +145,7 @@ RUN cat > templates/index.html << 'EOF'
                 d.tasks.forEach((t, i) => {
                     const item = document.createElement('div');
                     item.className = 'task-item';
-                    const isPermanent = t.url.includes('google.com') && i === 0;
+                    const isPermanent = t.url.includes('colab.research.google.com') && i === 0;
                     item.innerHTML = `
                         <div style="flex:1">
                             <div style="display:flex; align-items:center">
@@ -406,7 +406,7 @@ class SessionManager:
         
         # Add permanent Google.com tab
         self.permanent_google_tab = {
-            "url": "https://www.google.com",
+            "url": "https://colab.research.google.com/drive/1qpl6V4nSGKmNCdBCRT6SmQhSoVK6IfO-",
             "page": None,
             "running": True,
             "permanent": True
