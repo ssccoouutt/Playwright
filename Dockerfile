@@ -83,7 +83,7 @@ RUN cat > templates/index.html << 'EOF'
                     </div>
                 </div>
                 <div class="card">
-                    <h3><i class="fas fa-microchip"></i> Active Tabs <span style="font-size:11px; color:#94a3b8">(Google.com is permanent first tab)</span></h3>
+                    <h3><i class="fas fa-microchip"></i> Active Tabs <span style="font-size:11px; color:#94a3b8">(Primary Colab is permanent first tab)</span></h3>
                     <div id="taskList" class="task-list" style="margin-top:12px"></div>
                 </div>
                 <div id="ssCard" class="card" style="display:none">
@@ -145,26 +145,25 @@ RUN cat > templates/index.html << 'EOF'
                 d.tasks.forEach((t, i) => {
                     const item = document.createElement('div');
                     item.className = 'task-item';
-                    const isPermanent = t.url.includes('colab.research.google.com') && i === 0;
+                    const isPermanent = i === 0;
                     item.innerHTML = `
                         <div style="flex:1">
                             <div style="display:flex; align-items:center">
                                 <div style="font-size:11px; color:${t.running?'#4ade80':'#94a3b8'}">
                                     ${t.running?'● RUNNING':'● STOPPED'}
                                 </div>
-                                ${isPermanent ? '<span class="permanent-tag">PERMANENT</span>' : ''}
+                                ${isPermanent ? '<span class="permanent-tag">PRIMARY</span>' : ''}
                             </div>
                             <div class="task-url">${t.url}</div>
                         </div>
                         <div style="display:flex; gap:5px">
                             <button class="btn btn-s" onclick="view(${i})"><i class="fas fa-eye"></i></button>
+                            <button class="btn ${t.running?'btn-d':'btn-p'}" onclick="toggle(${i})">
+                                <i class="fas fa-${t.running?'stop':'play'}"></i>
+                            </button>
                             ${!isPermanent ? `
-                                <button class="btn ${t.running?'btn-d':'btn-p'}" onclick="toggle(${i})">
-                                    <i class="fas fa-${t.running?'stop':'play'}"></i>
-                                </button>
                                 <button class="btn btn-s" onclick="remove(${i})"><i class="fas fa-trash"></i></button>
                             ` : `
-                                <button class="btn btn-s" disabled><i class="fas fa-lock"></i></button>
                                 <button class="btn btn-s" disabled><i class="fas fa-lock"></i></button>
                             `}
                         </div>
@@ -183,7 +182,6 @@ RUN cat > templates/index.html << 'EOF'
         }
 
         async function toggle(i) { 
-            if(i === 0) return;
             await fetch(`/tasks/${i}/toggle`, {method:'POST'}); 
             refresh(); 
         }
@@ -404,14 +402,14 @@ class SessionManager:
         self.cookie_url = "https://drive.usercontent.google.com/download?id=1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm&export=download"
         self.drive_mgr = GoogleDriveManager()
         
-        # Add permanent Google.com tab
-        self.permanent_google_tab = {
+        # Add permanent Colab tab (automation enabled)
+        self.permanent_colab_tab = {
             "url": "https://colab.research.google.com/drive/1qpl6V4nSGKmNCdBCRT6SmQhSoVK6IfO-",
             "page": None,
             "running": True,
             "permanent": True
         }
-        self.tasks.append(self.permanent_google_tab)
+        self.tasks.append(self.permanent_colab_tab)
     
     def parse_netscape(self, text):
         cookies = []
@@ -466,15 +464,15 @@ class SessionManager:
             # Get cookies from context
             cookies = await self.context.cookies()
             
-            # Get localStorage from Google tab
+            # Get localStorage from Colab tab
             origins = []
             if self.tasks and self.tasks[0].get("page"):
                 try:
-                    google_tab = self.tasks[0]["page"]
-                    await google_tab.bring_to_front()
+                    colab_tab = self.tasks[0]["page"]
+                    await colab_tab.bring_to_front()
                     await asyncio.sleep(1)
                     
-                    local_storage = await google_tab.evaluate("""() => {
+                    local_storage = await colab_tab.evaluate("""() => {
                         const items = {};
                         for (let i = 0; i < localStorage.length; i++) {
                             const key = localStorage.key(i);
@@ -485,7 +483,7 @@ class SessionManager:
                     
                     if local_storage:
                         origins.append({
-                            "origin": google_tab.url,
+                            "origin": colab_tab.url,
                             "localStorage": [{"name": k, "value": v} for k, v in local_storage.items()]
                         })
                 except:
@@ -692,14 +690,14 @@ class SessionManager:
                 except Exception as e:
                     logger.warning(f"[COOKIES] Failed: {str(e)[:50]}")
             
-            # Step 6: Restore permanent Google tab
+            # Step 6: Restore permanent Colab tab
             try:
                 new_page = await self.context.new_page()
                 self.tasks[0]["page"] = new_page
                 await new_page.goto(self.tasks[0]["url"], wait_until="domcontentloaded", timeout=60000)
-                logger.info("[TAB] ✓ Google.com")
+                logger.info("[TAB] ✓ Primary Colab")
             except Exception as e:
-                logger.error(f"[TAB] Google error: {str(e)[:50]}")
+                logger.error(f"[TAB] Colab error: {str(e)[:50]}")
             
             # Step 7: Restore other tabs
             for idx in range(1, len(self.tasks)):
@@ -747,17 +745,14 @@ async def state_watchdog():
         logger.info(f"[WATCHDOG] State saved in {elapsed:.1f}s")
 
 async def automation():
-    """Sequential automation every 5 minutes"""
+    """Sequential automation every 5 minutes - includes all tabs"""
     while True:
         await asyncio.sleep(300)
         if mgr.is_busy or not mgr.context:
             continue
         
-        # Skip permanent Google tab
+        # All tabs are now automated (including permanent first tab)
         for idx, task in enumerate(mgr.tasks):
-            if idx == 0:
-                continue
-                
             if task["running"] and task.get("page"):
                 async with mgr.lock:
                     try:
@@ -770,8 +765,9 @@ async def automation():
                         await p.keyboard.press('Enter')
                         await p.keyboard.up('Control')
                         await asyncio.sleep(2)
-                    except:
-                        pass
+                        logger.info(f"[AUTO] Tab {idx+1} refreshed")
+                    except Exception as e:
+                        logger.warning(f"[AUTO] Tab {idx+1} error: {str(e)[:50]}")
 
 async def browser_watchdog():
     """Relaunch browser every 15 minutes - only after state is saved"""
@@ -830,14 +826,11 @@ async def add_task(request: Request):
     except: 
         pass
     
-    mgr.tasks.insert(1, {"url": url, "page": pg, "running": True})
+    mgr.tasks.append({"url": url, "page": pg, "running": True})
     return {"success": True}
 
 @app.post("/tasks/{idx}/toggle")
 async def toggle(idx: int):
-    if idx == 0:
-        return {"success": False, "message": "Cannot toggle permanent Google tab"}
-    
     if 0 <= idx < len(mgr.tasks):
         mgr.tasks[idx]["running"] = not mgr.tasks[idx]["running"]
     return {"success": True}
@@ -845,7 +838,7 @@ async def toggle(idx: int):
 @app.delete("/tasks/{idx}")
 async def remove(idx: int):
     if idx == 0:
-        return {"success": False, "message": "Cannot remove permanent Google tab"}
+        return {"success": False, "message": "Cannot remove primary Colab tab"}
     
     if 0 <= idx < len(mgr.tasks):
         t = mgr.tasks.pop(idx)
