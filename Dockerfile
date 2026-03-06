@@ -251,7 +251,7 @@ RUN cat > templates/index.html << 'EOF'
 </html>
 EOF
 
-# --- BACKEND SYSTEM WITH IMPROVED STABILITY ---
+# --- BACKEND SYSTEM ---
 RUN cat > main.py << 'EOF'
 import asyncio
 import os
@@ -262,13 +262,12 @@ import json
 import time
 import sys
 import io
-import traceback
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from playwright.async_api import async_playwright, Error as PlaywrightError
+from playwright.async_api import async_playwright
 
 # Google Drive imports
 from google.oauth2.credentials import Credentials
@@ -283,23 +282,14 @@ PKT = timezone(timedelta(hours=5))
 def pkt_now():
     return datetime.now(PKT).strftime('%H:%M:%S')
 
-# Configure logging with file output for debugging
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(message)s',
-    datefmt='%H:%M:%S',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('/tmp/colab_guard.log')
-    ]
-)
+# Configure minimal logging
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger()
 
 # Disable verbose logs
 logging.getLogger('playwright').setLevel(logging.WARNING)
 logging.getLogger('googleapiclient').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
-logging.getLogger('google.auth').setLevel(logging.WARNING)
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
@@ -312,7 +302,6 @@ class GoogleDriveManager:
         self.creds = None
         self.service = None
         self.folder_id = None
-        self.last_upload_cleanup = 0
         self.initialize()
     
     def initialize(self):
@@ -326,12 +315,12 @@ class GoogleDriveManager:
             if self.creds.expired and self.creds.refresh_token:
                 self.creds.refresh(GoogleRequest())
             
-            self.service = build('drive', 'v3', credentials=self.creds, cache_discovery=False)
+            self.service = build('drive', 'v3', credentials=self.creds)
             self.folder_id = self.get_or_create_folder('Colab_Guard_Pro')
             logger.info(f"[DRIVE] Ready | Folder: {self.folder_id}")
             
         except Exception as e:
-            logger.error(f"[DRIVE] Failed: {str(e)[:100]}")
+            logger.error(f"[DRIVE] Failed: {str(e)[:50]}")
             self.service = None
     
     def get_or_create_folder(self, folder_name):
@@ -351,49 +340,13 @@ class GoogleDriveManager:
             return folder.get('id')
             
         except Exception as e:
-            logger.error(f"[DRIVE] Folder error: {str(e)[:100]}")
+            logger.error(f"[DRIVE] Folder error: {str(e)[:50]}")
             return None
     
-    def cleanup_old_backups(self, max_backups=10):
-        """Keep only the most recent backups"""
-        if not self.service:
-            return
-        
-        try:
-            # Only cleanup every hour
-            if time.time() - self.last_upload_cleanup < 3600:
-                return
-            
-            query = f"name contains 'state_backup_' and '{self.folder_id}' in parents and trashed=false"
-            results = self.service.files().list(
-                q=query, 
-                fields="files(id, name, createdTime)",
-                orderBy="createdTime desc"
-            ).execute()
-            
-            files = results.get('files', [])
-            
-            # Delete old backups beyond max_backups
-            if len(files) > max_backups:
-                for file in files[max_backups:]:
-                    try:
-                        self.service.files().delete(fileId=file['id']).execute()
-                        logger.debug(f"[DRIVE] Cleaned old backup: {file['name']}")
-                    except:
-                        pass
-            
-            self.last_upload_cleanup = time.time()
-            
-        except Exception as e:
-            logger.warning(f"[DRIVE] Cleanup error: {str(e)[:100]}")
-    
-    def upload_with_retry(self, file_path, description="", max_retries=2):
+    def upload_with_retry(self, file_path, description="", max_retries=3):
         """Upload file with retry logic"""
         if not self.service:
             return None
-        
-        # Clean up old backups occasionally
-        self.cleanup_old_backups()
         
         for attempt in range(max_retries):
             try:
@@ -404,7 +357,7 @@ class GoogleDriveManager:
                     'parents': [self.folder_id]
                 }
                 
-                media = MediaFileUpload(file_path, resumable=False)
+                media = MediaFileUpload(file_path, resumable=False)  # Changed to non-resumable
                 file = self.service.files().create(
                     body=file_metadata,
                     media_body=media,
@@ -414,15 +367,12 @@ class GoogleDriveManager:
                 logger.info(f"[DRIVE] ✓ {file_name}")
                 return file.get('id')
                 
-            except (HttpError, BrokenPipeError, ConnectionError) as e:
-                if attempt < max_retries - 1:
-                    logger.warning(f"[DRIVE] Retry {attempt+1}/{max_retries}")
-                    time.sleep(2)
-                else:
-                    logger.error(f"[DRIVE] ✗ {file_name}: {str(e)[:100]}")
             except Exception as e:
-                logger.error(f"[DRIVE] ✗ {file_name}: {str(e)[:100]}")
-                break
+                if attempt < max_retries - 1:
+                    logger.warning(f"[DRIVE] Retry {attempt+1}/{max_retries}: {str(e)[:50]}")
+                    time.sleep(2 ** attempt)
+                else:
+                    logger.error(f"[DRIVE] ✗ {file_name}: {str(e)[:50]}")
         
         return None
     
@@ -448,20 +398,16 @@ class SessionManager:
         self.is_busy = False
         self.last_sync_time = 0
         self.sync_attempts = 0
-        self.storage_state = None
+        self.storage_state = None  # Initialize storage_state here
         self.cookie_url = "https://drive.usercontent.google.com/download?id=1NFy-Y6hnDlIDEyFnWSvLOxm4_eyIRsvm&export=download"
         self.drive_mgr = GoogleDriveManager()
-        self.last_health_check = time.time()
-        self.consecutive_failures = 0
-        self.max_consecutive_failures = 3
         
-        # Add permanent Colab tab
+        # Add permanent Colab tab (automation enabled)
         self.permanent_colab_tab = {
             "url": "https://colab.research.google.com/drive/1qpl6V4nSGKmNCdBCRT6SmQhSoVK6IfO-",
             "page": None,
             "running": True,
-            "permanent": True,
-            "last_activity": time.time()
+            "permanent": True
         }
         self.tasks.append(self.permanent_colab_tab)
     
@@ -477,84 +423,26 @@ class SessionManager:
                 })
         return cookies
     
-    async def health_check(self):
-        """Check if browser is still healthy"""
-        current_time = time.time()
-        
-        # Only check every 30 seconds
-        if current_time - self.last_health_check < 30:
-            return True
-        
-        self.last_health_check = current_time
-        
-        try:
-            if not self.browser:
-                logger.warning("[HEALTH] Browser is None")
-                return False
-            
-            if not self.browser.is_connected():
-                logger.warning("[HEALTH] Browser disconnected")
-                return False
-            
-            if not self.context:
-                logger.warning("[HEALTH] Context is None")
-                return False
-            
-            # Check if pages are responsive
-            if self.tasks and self.tasks[0].get("page"):
-                try:
-                    page = self.tasks[0]["page"]
-                    if page.is_closed():
-                        logger.warning("[HEALTH] Primary page closed")
-                        return False
-                    
-                    # Quick evaluate to check responsiveness
-                    await page.evaluate("1 + 1")
-                except PlaywrightError:
-                    logger.warning("[HEALTH] Page not responsive")
-                    return False
-                except Exception as e:
-                    logger.warning(f"[HEALTH] Page check failed: {str(e)[:100]}")
-                    return False
-            
-            # Reset failures on success
-            self.consecutive_failures = 0
-            return True
-            
-        except Exception as e:
-            self.consecutive_failures += 1
-            logger.error(f"[HEALTH] Check failed ({self.consecutive_failures}/{self.max_consecutive_failures}): {str(e)[:100]}")
-            
-            if self.consecutive_failures >= self.max_consecutive_failures:
-                logger.critical("[HEALTH] Too many failures, forcing relaunch")
-                asyncio.create_task(self.launch())
-            
-            return False
-    
     async def ensure_state_saved(self):
         """CRITICAL: Ensure state is saved before proceeding"""
-        if self.is_busy:
-            logger.warning("[SYNC] Skipping - busy")
-            return False
-        
-        max_attempts = 3
+        max_attempts = 10
         for attempt in range(max_attempts):
             try:
                 success = await self.sync_state_to_drive()
                 if success:
                     self.last_sync_time = time.time()
                     self.sync_attempts = 0
-                    logger.info(f"[SYNC] ✓ Saved")
+                    logger.info(f"[SYNC] ✓ Saved ({attempt+1} attempts)")
                     return True
                 else:
                     logger.warning(f"[SYNC] ✗ Attempt {attempt+1}/{max_attempts}")
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(5)
                     
             except Exception as e:
-                logger.error(f"[SYNC] Error: {str(e)[:100]}")
-                await asyncio.sleep(2)
+                logger.error(f"[SYNC] Error: {str(e)[:50]}")
+                await asyncio.sleep(5)
         
-        # Emergency fallback
+        # Emergency fallback: save locally
         try:
             if self.storage_state:
                 with open('/tmp/emergency_state.json', 'w') as f:
@@ -564,10 +452,11 @@ class SessionManager:
         except:
             pass
         
+        logger.error("[SYNC] ✗✗✗ FAILED TO SAVE STATE ✗✗✗")
         return False
     
     async def sync_state_to_drive(self):
-        """Save state to Google Drive"""
+        """Save state to Google Drive with retry logic"""
         if not self.context:
             return False
         
@@ -577,23 +466,19 @@ class SessionManager:
             
             # Get localStorage from Colab tab
             origins = []
-            if self.tasks and self.tasks[0].get("page") and not self.tasks[0]["page"].is_closed():
+            if self.tasks and self.tasks[0].get("page"):
                 try:
                     colab_tab = self.tasks[0]["page"]
                     await colab_tab.bring_to_front()
                     await asyncio.sleep(1)
                     
                     local_storage = await colab_tab.evaluate("""() => {
-                        try {
-                            const items = {};
-                            for (let i = 0; i < localStorage.length; i++) {
-                                const key = localStorage.key(i);
-                                items[key] = localStorage.getItem(key);
-                            }
-                            return items;
-                        } catch(e) {
-                            return {};
+                        const items = {};
+                        for (let i = 0; i < localStorage.length; i++) {
+                            const key = localStorage.key(i);
+                            items[key] = localStorage.getItem(key);
                         }
+                        return items;
                     }""")
                     
                     if local_storage:
@@ -634,37 +519,42 @@ class SessionManager:
                 json.dump(tabs_data, f)
             
             # Upload to Drive
-            if self.drive_mgr.service:
-                self.drive_mgr.upload_with_retry(local_state_path, "Browser session state")
-                self.drive_mgr.upload_with_retry(local_tabs_path, "Saved browser tabs")
-                
-                # Create timestamped backup (less frequently)
-                if self.last_sync_time == 0 or time.time() - self.last_sync_time > 3600:
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    backup_path = f'/tmp/state_backup_{timestamp}.json'
-                    with open(backup_path, 'w') as f:
-                        json.dump(state_data, f)
-                    self.drive_mgr.upload_with_retry(backup_path, f"State backup {timestamp}")
-                    try:
-                        os.remove(backup_path)
-                    except:
-                        pass
+            state_uploaded = False
+            tabs_uploaded = False
             
-            # Always save locally
+            if self.drive_mgr.service:
+                # Upload state
+                state_id = self.drive_mgr.upload_with_retry(local_state_path, "Browser session state")
+                state_uploaded = state_id is not None
+                
+                # Upload tabs
+                tabs_id = self.drive_mgr.upload_with_retry(local_tabs_path, "Saved browser tabs")
+                tabs_uploaded = tabs_id is not None
+                
+                # Create backup with timestamp
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                backup_path = f'/tmp/state_backup_{timestamp}.json'
+                with open(backup_path, 'w') as f:
+                    json.dump(state_data, f)
+                self.drive_mgr.upload_with_retry(backup_path, f"State backup {timestamp}")
+                os.remove(backup_path)
+            else:
+                logger.warning("[DRIVE] Skipping upload - service unavailable")
+            
+            # Always save locally as backup
             self.storage_state = state_data
             
-            # Cleanup temp files
-            for path in [local_state_path, local_tabs_path]:
-                try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                except:
-                    pass
+            # Cleanup
+            try:
+                os.remove(local_state_path)
+                os.remove(local_tabs_path)
+            except:
+                pass
             
-            return True
+            return state_uploaded or not self.drive_mgr.service
             
         except Exception as e:
-            logger.error(f"[SYNC] Save error: {str(e)[:100]}")
+            logger.error(f"[SYNC] Save error: {str(e)[:50]}")
             return False
     
     def load_state_from_drive(self):
@@ -673,10 +563,12 @@ class SessionManager:
             return None
         
         try:
+            # Check if state exists
             if not self.drive_mgr.file_exists("browser_state.json"):
                 logger.info("[STATE] No saved state found")
                 return None
             
+            # Download state
             query = f"name='browser_state.json' and '{self.drive_mgr.folder_id}' in parents and trashed=false"
             results = self.drive_mgr.service.files().list(q=query, fields="files(id, name)").execute()
             files = results.get('files', [])
@@ -700,24 +592,20 @@ class SessionManager:
             return state_data
             
         except Exception as e:
-            logger.error(f"[STATE] Load error: {str(e)[:100]}")
+            logger.error(f"[STATE] Load error: {str(e)[:50]}")
             return None
     
     async def critical_screenshot(self, stage="unknown"):
-        """Take critical screenshot"""
+        """Take critical screenshot and save to Drive"""
         if not self.tasks or not self.tasks[0].get("page"):
             return
         
         try:
-            page = self.tasks[0]["page"]
-            if page.is_closed():
-                return
-                
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"critical_{stage}_{timestamp}.png"
             local_path = f"/tmp/{filename}"
             
-            await page.screenshot(path=local_path, timeout=10000)
+            await self.tasks[0]["page"].screenshot(path=local_path)
             
             # Upload to Drive
             if self.drive_mgr.service:
@@ -730,12 +618,11 @@ class SessionManager:
                 pass
             
         except Exception as e:
-            logger.warning(f"[SS] Failed: {str(e)[:100]}")
+            logger.warning(f"[SS] Failed: {str(e)[:50]}")
     
     async def launch(self):
-        """Restores browser engine"""
-        if self.is_busy:
-            logger.warning("[ENGINE] Already busy, skipping")
+        """Restores browser engine - BLOCKS until state is saved"""
+        if self.is_busy: 
             return
         
         self.is_busy = True
@@ -743,26 +630,20 @@ class SessionManager:
         try:
             logger.info(">>> ENGINE: STARTING")
             
-            # Step 1: Save current state
+            # Step 1: Save current state before closing
             if self.context:
                 logger.info("[SYNC] Saving state before relaunch...")
                 await self.ensure_state_saved()
                 await self.critical_screenshot("before_relaunch")
             
-            # Step 2: Close existing browser with timeout
+            # Step 2: Close existing browser
             try:
-                close_tasks = []
-                if self.context:
-                    close_tasks.append(asyncio.create_task(self.context.close()))
-                if self.browser:
-                    close_tasks.append(asyncio.create_task(self.browser.close()))
-                if self.pw:
-                    close_tasks.append(asyncio.create_task(self.pw.stop()))
-                
-                if close_tasks:
-                    await asyncio.wait_for(asyncio.gather(*close_tasks, return_exceptions=True), timeout=10)
-            except asyncio.TimeoutError:
-                logger.warning("[ENGINE] Close timeout, forcing")
+                if self.context: 
+                    await self.context.close()
+                if self.browser: 
+                    await self.browser.close()
+                if self.pw: 
+                    await self.pw.stop()
             except:
                 pass
             
@@ -772,14 +653,12 @@ class SessionManager:
                 headless=True,
                 args=[
                     '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
-                    '--js-flags="--max-old-space-size=256"',
-                    '--disable-extensions', '--no-zygote',
-                    '--disable-setuid-sandbox', '--disable-accelerated-2d-canvas',
-                    '--disable-gl-drawing-for-tests'
+                    '--js-flags="--max-old-space-size=128"',
+                    '--disable-extensions', '--no-zygote', '--single-process'
                 ]
             )
             
-            # Step 4: Load state
+            # Step 4: Load state from Drive
             drive_state = self.load_state_from_drive()
             if drive_state:
                 self.storage_state = drive_state
@@ -790,16 +669,16 @@ class SessionManager:
                 logger.info("[STATE] Starting fresh")
                 self.storage_state = None
             
-            # Step 5: Create context
-            context_options = {
-                'viewport': {'width': 1280, 'height': 720},
-                'user_agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            }
-            
+            # Step 5: Create context with saved state
             if self.storage_state:
-                self.context = await self.browser.new_context(storage_state=self.storage_state, **context_options)
+                self.context = await self.browser.new_context(
+                    storage_state=self.storage_state,
+                    viewport={'width': 1280, 'height': 720}
+                )
             else:
-                self.context = await self.browser.new_context(**context_options)
+                self.context = await self.browser.new_context(
+                    viewport={'width': 1280, 'height': 720}
+                )
                 
                 # Load seed cookies
                 try:
@@ -809,32 +688,36 @@ class SessionManager:
                         await self.context.add_cookies(cookies)
                         logger.info(f"[COOKIES] Loaded {len(cookies)} seed")
                 except Exception as e:
-                    logger.warning(f"[COOKIES] Failed: {str(e)[:100]}")
+                    logger.warning(f"[COOKIES] Failed: {str(e)[:50]}")
             
-            # Step 6: Restore tabs
-            for idx, task in enumerate(self.tasks):
+            # Step 6: Restore permanent Colab tab
+            try:
+                new_page = await self.context.new_page()
+                self.tasks[0]["page"] = new_page
+                await new_page.goto(self.tasks[0]["url"], wait_until="domcontentloaded", timeout=60000)
+                logger.info("[TAB] ✓ Primary Colab")
+            except Exception as e:
+                logger.error(f"[TAB] Colab error: {str(e)[:50]}")
+            
+            # Step 7: Restore other tabs
+            for idx in range(1, len(self.tasks)):
                 try:
                     new_page = await self.context.new_page()
-                    task["page"] = new_page
-                    task["last_activity"] = time.time()
-                    
-                    await new_page.goto(task["url"], wait_until="domcontentloaded", timeout=30000)
-                    logger.info(f"[TAB] ✓ {idx+1}: {task['url'][:40]}...")
+                    self.tasks[idx]["page"] = new_page
+                    await new_page.goto(self.tasks[idx]["url"], wait_until="domcontentloaded", timeout=60000)
+                    logger.info(f"[TAB] ✓ {idx+1}: {self.tasks[idx]['url'][:40]}...")
                 except Exception as e:
-                    logger.warning(f"[TAB] {idx+1} error: {str(e)[:100]}")
+                    logger.warning(f"[TAB] {idx+1} error: {str(e)[:50]}")
             
-            # Step 7: Save state
+            # Step 8: Save state after successful launch
             logger.info("[SYNC] Saving state after launch...")
             await self.ensure_state_saved()
             await self.critical_screenshot("after_relaunch")
             
-            self.consecutive_failures = 0
             logger.info(">>> ENGINE: ONLINE ✓")
             
         except Exception as e:
             logger.error(f">>> ENGINE: FAILED - {str(e)}")
-            logger.error(traceback.format_exc())
-            self.consecutive_failures += 1
             try:
                 await self.critical_screenshot("launch_failure")
             except:
@@ -845,138 +728,64 @@ class SessionManager:
 mgr = SessionManager()
 
 async def state_watchdog():
-    """Save state periodically"""
+    """CRITICAL: Ensure state is saved every 15 minutes - BLOCKS until saved"""
     while True:
-        try:
-            await asyncio.sleep(900)  # 15 minutes
-            
-            if mgr.is_busy:
-                logger.debug("[WATCHDOG] Busy, skipping")
-                continue
-            
-            # Check health first
-            if not await mgr.health_check():
-                logger.warning("[WATCHDOG] Health check failed, skipping save")
-                continue
-            
-            logger.info("[WATCHDOG] Scheduled state save...")
-            start_time = time.time()
-            
-            await mgr.ensure_state_saved()
-            
-            elapsed = time.time() - start_time
-            logger.info(f"[WATCHDOG] State saved in {elapsed:.1f}s")
-            
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"[WATCHDOG] Error: {str(e)[:100]}")
-            await asyncio.sleep(60)
+        await asyncio.sleep(900)  # 15 minutes
+        
+        if mgr.is_busy:
+            continue
+        
+        logger.info("[WATCHDOG] Scheduled state save...")
+        start_time = time.time()
+        
+        # BLOCKING CALL - will retry until successful
+        await mgr.ensure_state_saved()
+        
+        elapsed = time.time() - start_time
+        logger.info(f"[WATCHDOG] State saved in {elapsed:.1f}s")
 
 async def automation():
-    """Sequential automation every 5 minutes"""
+    """Sequential automation every 5 minutes - includes all tabs"""
     while True:
-        try:
-            await asyncio.sleep(300)
-            
-            if mgr.is_busy or not mgr.context:
-                continue
-            
-            # Check health before automation
-            if not await mgr.health_check():
-                logger.warning("[AUTO] Health check failed, skipping")
-                continue
-            
-            # Refresh all running tabs
-            for idx, task in enumerate(mgr.tasks):
-                if not task["running"]:
-                    continue
-                
-                if not task.get("page") or task["page"].is_closed():
-                    logger.warning(f"[AUTO] Tab {idx+1} page closed, recreating")
-                    try:
-                        new_page = await mgr.context.new_page()
-                        task["page"] = new_page
-                        await new_page.goto(task["url"], wait_until="domcontentloaded", timeout=30000)
-                    except Exception as e:
-                        logger.error(f"[AUTO] Failed to recreate tab {idx+1}: {str(e)[:100]}")
-                        continue
-                
+        await asyncio.sleep(300)
+        if mgr.is_busy or not mgr.context:
+            continue
+        
+        # All tabs are now automated (including permanent first tab)
+        for idx, task in enumerate(mgr.tasks):
+            if task["running"] and task.get("page"):
                 async with mgr.lock:
                     try:
                         p = task["page"]
+                        if p.is_closed():
+                            continue
+                            
                         await p.bring_to_front()
                         await p.keyboard.down('Control')
                         await p.keyboard.press('Enter')
                         await p.keyboard.up('Control')
                         await asyncio.sleep(2)
-                        task["last_activity"] = time.time()
                         logger.info(f"[AUTO] Tab {idx+1} refreshed")
-                    except PlaywrightError as e:
-                        logger.warning(f"[AUTO] Tab {idx+1} error: {str(e)[:100]}")
-                        task["page"] = None
                     except Exception as e:
-                        logger.warning(f"[AUTO] Tab {idx+1} error: {str(e)[:100]}")
-                        
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"[AUTO] Error: {str(e)[:100]}")
-            await asyncio.sleep(60)
+                        logger.warning(f"[AUTO] Tab {idx+1} error: {str(e)[:50]}")
 
 async def browser_watchdog():
-    """Relaunch browser periodically or on failure"""
+    """Relaunch browser every 15 minutes - only after state is saved"""
     while True:
-        try:
-            await asyncio.sleep(300)  # Check every 5 minutes
-            
-            # Check health
-            if not await mgr.health_check():
-                logger.warning("[BROWSER] Health check failed, forcing relaunch")
-                await mgr.launch()
-                continue
-            
-            # Scheduled relaunch every 30 minutes
-            if time.time() - mgr.last_sync_time > 1800 and not mgr.is_busy:
-                logger.info("[BROWSER] Scheduled relaunch...")
-                await mgr.launch()
-                
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"[BROWSER] Error: {str(e)[:100]}")
-            await asyncio.sleep(60)
-
-async def global_error_handler():
-    """Global error handler to catch unhandled exceptions"""
-    while True:
-        try:
-            await asyncio.sleep(60)
-            # Check if main tasks are still running
-            tasks = asyncio.all_tasks()
-            main_tasks = [t for t in tasks if t.get_name() in ['state_watchdog', 'automation', 'browser_watchdog']]
-            
-            if len(main_tasks) < 3:
-                logger.warning(f"[GLOBAL] Missing tasks: {len(main_tasks)}/3, recreating")
-                if not any(t.get_name() == 'state_watchdog' for t in main_tasks):
-                    asyncio.create_task(state_watchdog(), name='state_watchdog')
-                if not any(t.get_name() == 'automation' for t in main_tasks):
-                    asyncio.create_task(automation(), name='automation')
-                if not any(t.get_name() == 'browser_watchdog' for t in main_tasks):
-                    asyncio.create_task(browser_watchdog(), name='browser_watchdog')
-                    
-        except Exception as e:
-            logger.error(f"[GLOBAL] Error: {str(e)[:100]}")
-            await asyncio.sleep(60)
+        await asyncio.sleep(900)
+        
+        if mgr.is_busy:
+            continue
+        
+        logger.info("[BROWSER] Scheduled relaunch...")
+        await mgr.launch()
 
 @app.on_event("startup")
 async def start():
-    # Create named tasks for better tracking
-    asyncio.create_task(mgr.launch(), name='initial_launch')
-    asyncio.create_task(state_watchdog(), name='state_watchdog')
-    asyncio.create_task(browser_watchdog(), name='browser_watchdog')
-    asyncio.create_task(automation(), name='automation')
-    asyncio.create_task(global_error_handler(), name='global_error_handler')
+    asyncio.create_task(mgr.launch())
+    asyncio.create_task(state_watchdog())
+    asyncio.create_task(browser_watchdog())
+    asyncio.create_task(automation())
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
@@ -984,109 +793,75 @@ async def home(request: Request):
 
 @app.get("/status")
 async def get_status():
-    try:
-        proc = psutil.Process(os.getpid())
-        mem = proc.memory_info().rss / (1024*1024)
-        for c in proc.children(recursive=True):
-            try: 
-                mem += c.memory_info().rss / (1024*1024)
-            except: 
-                pass
-        
-        size_kb = 0
-        if mgr.storage_state:
-            try:
-                size_kb = len(json.dumps(mgr.storage_state)) // 1024
-            except:
-                pass
-        
-        # Check if browser is alive
-        browser_alive = False
-        if mgr.browser:
-            try:
-                browser_alive = mgr.browser.is_connected()
-            except:
-                pass
-        
-        return {
-            "alive": browser_alive,
-            "memory": int(mem),
-            "session_size_kb": size_kb,
-            "tasks": [{"url": t["url"], "running": t["running"]} for t in mgr.tasks]
-        }
-    except Exception as e:
-        logger.error(f"[STATUS] Error: {str(e)[:100]}")
-        return {"alive": False, "memory": 0, "session_size_kb": 0, "tasks": []}
+    proc = psutil.Process(os.getpid())
+    mem = proc.memory_info().rss / (1024*1024)
+    for c in proc.children(recursive=True):
+        try: mem += c.memory_info().rss / (1024*1024)
+        except: pass
+    
+    size_kb = 0
+    if mgr.storage_state:
+        try:
+            size_kb = len(json.dumps(mgr.storage_state)) // 1024
+        except:
+            pass
+    
+    return {
+        "alive": mgr.browser.is_connected() if mgr.browser else False,
+        "memory": int(mem),
+        "session_size_kb": size_kb,
+        "tasks": [{"url": t["url"], "running": t["running"]} for t in mgr.tasks]
+    }
 
 @app.post("/tasks")
 async def add_task(request: Request):
-    try:
-        data = await request.json()
-        url = data.get("url")
-        if not url or not mgr.context: 
-            return {"success": False}
-        
-        pg = await mgr.context.new_page()
-        try: 
-            await pg.goto(url, wait_until="domcontentloaded", timeout=30000)
-        except: 
-            pass
-        
-        mgr.tasks.append({
-            "url": url, 
-            "page": pg, 
-            "running": True,
-            "last_activity": time.time()
-        })
-        return {"success": True}
-    except Exception as e:
-        logger.error(f"[ADD] Error: {str(e)[:100]}")
-        return {"success": False, "message": str(e)[:100]}
+    data = await request.json()
+    url = data.get("url")
+    if not url or not mgr.context: 
+        return {"success": False}
+    
+    pg = await mgr.context.new_page()
+    try: 
+        await pg.goto(url, wait_until="domcontentloaded", timeout=60000)
+    except: 
+        pass
+    
+    mgr.tasks.append({"url": url, "page": pg, "running": True})
+    return {"success": True}
 
 @app.post("/tasks/{idx}/toggle")
 async def toggle(idx: int):
-    try:
-        if 0 <= idx < len(mgr.tasks):
-            mgr.tasks[idx]["running"] = not mgr.tasks[idx]["running"]
-        return {"success": True}
-    except Exception as e:
-        return {"success": False, "message": str(e)[:100]}
+    if 0 <= idx < len(mgr.tasks):
+        mgr.tasks[idx]["running"] = not mgr.tasks[idx]["running"]
+    return {"success": True}
 
 @app.delete("/tasks/{idx}")
 async def remove(idx: int):
-    try:
-        if idx == 0:
-            return {"success": False, "message": "Cannot remove primary Colab tab"}
-        
-        if 0 <= idx < len(mgr.tasks):
-            t = mgr.tasks.pop(idx)
-            try: 
-                if t.get("page") and not t["page"].is_closed():
-                    await t["page"].close()
-            except: 
-                pass
-        return {"success": True}
-    except Exception as e:
-        return {"success": False, "message": str(e)[:100]}
+    if idx == 0:
+        return {"success": False, "message": "Cannot remove primary Colab tab"}
+    
+    if 0 <= idx < len(mgr.tasks):
+        t = mgr.tasks.pop(idx)
+        try: 
+            await t["page"].close()
+        except: 
+            pass
+    return {"success": True}
 
 @app.get("/tasks/{idx}/screenshot")
 async def ss(idx: int):
     if mgr.is_busy:
         return {"success": False, "message": "Browser is busy"}
     
-    try:
-        if 0 <= idx < len(mgr.tasks):
-            page = mgr.tasks[idx].get("page")
-            if not page or page.is_closed():
-                return {"success": False, "message": "Page closed"}
-            
+    if 0 <= idx < len(mgr.tasks):
+        try:
             async with mgr.lock:
                 name = f"ss_{idx}_{int(time.time())}.png"
                 path = f"screenshots/{name}"
-                await page.screenshot(path=path, timeout=10000)
+                await mgr.tasks[idx]["page"].screenshot(path=path, timeout=10000)
                 return {"success": True, "file": name}
-    except Exception as e:
-        logger.warning(f"[SS] Failed for tab {idx}: {str(e)[:100]}")
+        except Exception as e:
+            logger.warning(f"[SS] Failed for tab {idx}: {str(e)[:50]}")
     
     return {"success": False}
 
@@ -1097,10 +872,10 @@ async def relaunch():
 
 @app.post("/load-cookies")
 async def load_cookies():
+    if not mgr.context:
+        return {"success": False, "message": "Browser not ready"}
+    
     try:
-        if not mgr.context:
-            return {"success": False, "message": "Browser not ready"}
-        
         r = requests.get(mgr.cookie_url, timeout=10)
         if r.status_code == 200:
             cookies = mgr.parse_netscape(r.text)
@@ -1109,9 +884,9 @@ async def load_cookies():
             
             # Apply to all tabs
             for task in mgr.tasks:
-                if task.get("page") and not task["page"].is_closed():
+                if task.get("page"):
                     try:
-                        await task["page"].reload(wait_until="domcontentloaded", timeout=30000)
+                        await task["page"].reload(wait_until="domcontentloaded")
                     except:
                         pass
             
@@ -1120,21 +895,21 @@ async def load_cookies():
         else:
             return {"success": False, "message": f"Failed: HTTP {r.status_code}"}
     except Exception as e:
-        logger.error(f"[COOKIES] Error: {str(e)[:100]}")
-        return {"success": False, "message": f"Error: {str(e)[:100]}"}
+        logger.error(f"[COOKIES] Error: {str(e)[:50]}")
+        return {"success": False, "message": f"Error: {str(e)[:50]}"}
 
 @app.post("/load-custom-cookies")
 async def load_custom_cookies(request: Request):
+    if not mgr.context:
+        return {"success": False, "message": "Browser not ready"}
+    
+    data = await request.json()
+    cookie_text = data.get("cookies", "")
+    
+    if not cookie_text:
+        return {"success": False, "message": "No cookies provided"}
+    
     try:
-        if not mgr.context:
-            return {"success": False, "message": "Browser not ready"}
-        
-        data = await request.json()
-        cookie_text = data.get("cookies", "")
-        
-        if not cookie_text:
-            return {"success": False, "message": "No cookies provided"}
-        
         cookies = mgr.parse_netscape(cookie_text)
         if not cookies:
             return {"success": False, "message": "No valid cookies"}
@@ -1144,33 +919,22 @@ async def load_custom_cookies(request: Request):
         
         # Apply to all tabs
         for task in mgr.tasks:
-            if task.get("page") and not task["page"].is_closed():
+            if task.get("page"):
                 try:
-                    await task["page"].reload(wait_until="domcontentloaded", timeout=30000)
+                    await task["page"].reload(wait_until="domcontentloaded")
                 except:
                     pass
         
         logger.info(f"[COOKIES] Custom: {len(cookies)}")
         return {"success": True, "message": f"Loaded {len(cookies)} custom cookies"}
     except Exception as e:
-        logger.error(f"[COOKIES] Custom error: {str(e)[:100]}")
-        return {"success": False, "message": f"Error: {str(e)[:100]}"}
+        logger.error(f"[COOKIES] Custom error: {str(e)[:50]}")
+        return {"success": False, "message": f"Error: {str(e)[:50]}"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=int(os.environ.get("PORT", 8000)), 
-        log_level="warning",
-        timeout_keep_alive=30
-    )
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), log_level="warning")
 EOF
 
 EXPOSE 8000
-
-# Add healthcheck
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-  CMD python -c "import requests; requests.get('http://localhost:8000/status', timeout=5)" || exit 1
-
 CMD ["python", "main.py"]
